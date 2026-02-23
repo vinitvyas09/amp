@@ -3086,18 +3086,22 @@ We'll train TinyGPT on a character-level next-token prediction task using an in-
 
 **Why character-level?** No external downloads, stable, deterministic, and still exercises the transformer mechanics that matter for autocast (attention, layernorm, softmax, embeddings).
 
-**We will compare:**
-- FP32 baseline
-- Naive FP16 (params in FP16, no autocast, no scaler) — expected to be unstable
-- AMP FP16 (autocast + GradScaler)
-- AMP BF16 (autocast, no scaler)
+**We will compare (device-dependent):**
+- **Always:** FP32 baseline
+- **CUDA:** naive FP16/BF16 (cast-everything baselines) + AMP FP16 (with GradScaler) + AMP BF16 (if supported)
+- **CPU:** BF16 autocast (numerics-focused; speedups vary by CPU/kernel support)
+- **MPS:** FP16 autocast (+ BF16 autocast if your MPS backend supports it)
+
+Before the full training suite, we'll also do:
+- A **single-batch numerical drift** comparison: FP32 vs autocast (loss + gradient deltas).
+- A qualitative **text-generation sanity check** from each successfully trained regime.
 
 **We will log:**
 - Training loss
 - Validation loss
-- Gradient norm
-- Step time
-- CUDA memory
+- Gradient norm + exact-zero gradient fraction (underflow proxy)
+- Step time + throughput (tokens/s)
+- CUDA peak memory (if CUDA)
 - GradScaler scale (for FP16 AMP)
 """)
 
@@ -3180,6 +3184,142 @@ def estimate_loss(model, block_size, batch_size, iters=20, use_autocast=False, a
         out[split] = float(np.mean(losses))
     model.train()
     return out
+""")
+
+md(r"""
+### 3.6.0 A microscope view: what autocast changes numerically (one fixed batch)
+
+Before we look at full training curves, let's make autocast *concrete*:
+
+- Take the **same** model initialization and the **same** batch.
+- Compute loss + gradients in strict **FP32**.
+- Compute loss + gradients under **autocast** (FP16/BF16) with **FP32 parameters** (the usual AMP setup).
+- Quantify the deltas.
+
+This is the most direct way to understand "mixed precision": it introduces **small, structured numerical error** in specific parts of the forward/backward graph. The goal of AMP is not "no error" — it's "bounded error that doesn't break training, in exchange for speed/memory gains".
+""")
+
+code(r"""
+# Single-batch numerical drift: FP32 vs autocast
+import copy
+
+set_seed(123)
+
+# A tiny fixed batch to make this fast and deterministic.
+DRIFT_BS = 4
+DRIFT_BLOCK = 64
+x_drift, y_drift = get_batch("train", DRIFT_BS, DRIFT_BLOCK)
+
+base = TinyGPT(
+    vocab_size=vocab_size,
+    block_size=DRIFT_BLOCK,
+    n_layer=2,
+    n_embd=128,
+    n_heads=4,
+    dropout=0.0,
+).to(device).float()
+
+def loss_and_grads(model, x, y, use_autocast=False, amp_dtype=None):
+    for p in model.parameters():
+        p.grad = None
+    with amp_autocast(device, amp_dtype, enabled=use_autocast):
+        logits = model(x)
+        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+    loss.backward()
+    grads = {n: p.grad.detach().float().cpu().clone() for n, p in model.named_parameters() if p.grad is not None}
+    return float(loss.detach().cpu()), grads
+
+loss_fp32, grads_fp32 = loss_and_grads(base, x_drift, y_drift, use_autocast=False, amp_dtype=None)
+
+def compare_grads(grads_ref, grads_test):
+    names = sorted(grads_ref.keys())
+    v0 = torch.cat([grads_ref[n].flatten() for n in names])
+    v1 = torch.cat([grads_test[n].flatten() for n in names])
+    rel_l2 = float((v1 - v0).norm() / (v0.norm() + 1e-12))
+    cos = float(F.cosine_similarity(v0, v1, dim=0))
+
+    per_param = []
+    for n in names:
+        g0 = grads_ref[n]
+        g1 = grads_test[n]
+        denom = float(g0.norm()) + 1e-12
+        per_param.append({
+            "param": n,
+            "ref_norm": float(g0.norm()),
+            "rel_l2": float((g1 - g0).norm() / denom),
+            "max_abs_diff": float((g1 - g0).abs().max()),
+        })
+    df = pd.DataFrame(per_param)
+    summary = {
+        "grad_rel_l2": rel_l2,
+        "grad_cosine": cos,
+        "param_rel_l2_median": float(df["rel_l2"].median()),
+        "param_rel_l2_p90": float(df["rel_l2"].quantile(0.90)),
+        "param_rel_l2_max": float(df["rel_l2"].max()),
+    }
+    return df, summary
+
+candidates = []
+for dt in [torch.float16, torch.bfloat16]:
+    if dt is torch.float16 and device.type == "cpu":
+        continue
+    if device.type == "cuda" and dt is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        continue
+    if not supports_dtype_on_device(dt, device):
+        continue
+    candidates.append(dt)
+
+rows = []
+per_param_dfs = {}
+
+print(f"Reference FP32 loss: {loss_fp32:.6f}")
+
+for amp_dt in candidates:
+    name = str(amp_dt).replace("torch.", "")
+    try:
+        m = copy.deepcopy(base)
+        loss_amp, grads_amp = loss_and_grads(m, x_drift, y_drift, use_autocast=True, amp_dtype=amp_dt)
+        df_param, s = compare_grads(grads_fp32, grads_amp)
+        per_param_dfs[name] = df_param
+        rows.append({
+            "amp_dtype": name,
+            "status": "ok",
+            "loss_amp": loss_amp,
+            "loss_abs_diff": abs(loss_amp - loss_fp32),
+            "loss_rel_diff": abs(loss_amp - loss_fp32) / max(abs(loss_fp32), 1e-12),
+            **s,
+        })
+    except Exception as e:
+        rows.append({
+            "amp_dtype": name,
+            "status": f"failed: {type(e).__name__}",
+            "loss_amp": float("nan"),
+            "loss_abs_diff": float("nan"),
+            "loss_rel_diff": float("nan"),
+            "grad_rel_l2": float("nan"),
+            "grad_cosine": float("nan"),
+            "param_rel_l2_median": float("nan"),
+            "param_rel_l2_p90": float("nan"),
+            "param_rel_l2_max": float("nan"),
+        })
+        print(f"[warn] autocast drift compare failed for {amp_dt}: {e}")
+
+df = pd.DataFrame(rows)
+display(df)
+
+for amp_name, df_param in per_param_dfs.items():
+    print(f"\nTop gradient-relative-error parameters for autocast({amp_name}) vs FP32:")
+    display(df_param.sort_values('rel_l2', ascending=False).head(10))
+
+if per_param_dfs:
+    plt.figure(figsize=(10, 3))
+    for amp_name, df_param in per_param_dfs.items():
+        plt.hist(np.log10(df_param["rel_l2"].to_numpy() + 1e-20), bins=40, alpha=0.5, label=amp_name)
+    plt.title("Per-parameter gradient relative L2 error (autocast vs FP32)")
+    plt.xlabel("log10(rel_l2 + 1e-20)")
+    plt.ylabel("count")
+    plt.legend()
+    plt.tight_layout();
 """)
 
 code(r"""
@@ -3293,7 +3433,10 @@ def train_one(cfg):
                 logs["val_step"].append(step)
                 logs["val_loss"].append(float("nan"))
 
-    return {"config": cfg, "status": status, "logs": logs}
+    # Save final weights for downstream analysis (e.g., text generation).
+    # Store as FP32 on CPU for portability and to avoid holding multiple GPU copies.
+    state_dict_fp32 = {k: v.detach().float().cpu() for k, v in model.state_dict().items()}
+    return {"config": cfg, "status": status, "logs": logs, "state_dict": state_dict_fp32}
 """)
 
 code(r"""
@@ -3338,6 +3481,19 @@ elif device.type == "cpu":
         use_autocast=True, amp_dtype=torch.bfloat16,
         param_dtype=torch.float32,
     ))
+elif device.type == "mps":
+    if supports_dtype_on_device(torch.float16, device):
+        suite.append(TrainConfig(
+            name="amp_fp16_mps", steps=BASE_STEPS,
+            use_autocast=True, amp_dtype=torch.float16,
+            use_grad_scaler=False, param_dtype=torch.float32,
+        ))
+    if supports_dtype_on_device(torch.bfloat16, device):
+        suite.append(TrainConfig(
+            name="amp_bf16_mps", steps=BASE_STEPS,
+            use_autocast=True, amp_dtype=torch.bfloat16,
+            use_grad_scaler=False, param_dtype=torch.float32,
+        ))
 
 print("Planned experiments:")
 for cfg in suite:
@@ -3347,28 +3503,54 @@ for cfg in suite:
 code(r"""
 # Run all experiments
 
+def _empty_logs():
+    return {
+        "step": [], "train_loss": [], "grad_norm": [], "zero_grad_frac": [],
+        "step_time_ms": [], "tokens_per_s": [], "scale": [],
+        "cuda_mem_mb": [], "val_step": [], "val_loss": [],
+    }
+
+def _safe_ppl(loss):
+    try:
+        return float(math.exp(float(loss)))
+    except OverflowError:
+        return float("inf")
+
 results = []
 for cfg in suite:
     print(f"\n{'='*50}")
     print(f"Running: {cfg.name}")
     print(f"{'='*50}")
-    res = train_one(cfg)
-    print(f"  Status: {res['status']}, Steps: {len(res['logs']['step'])}")
-    if res['logs']['train_loss']:
-        print(f"  Final train loss: {res['logs']['train_loss'][-1]:.4f}")
-    results.append(res)
+    try:
+        res = train_one(cfg)
+        print(f"  Status: {res['status']}, Steps: {len(res['logs']['step'])}")
+        if res['logs']['train_loss']:
+            print(f"  Final train loss: {res['logs']['train_loss'][-1]:.4f}")
+        results.append(res)
+    except Exception as e:
+        print(f"  Exception: {type(e).__name__}: {e}")
+        results.append({
+            "config": cfg,
+            "status": f"exception: {type(e).__name__}",
+            "logs": _empty_logs(),
+            "state_dict": None,
+        })
 
 # Summary table
 summary_rows = []
 for r in results:
     cfg, logs = r["config"], r["logs"]
     n = len(logs["step"])
+    final_train_loss = logs["train_loss"][-1] if n else None
+    final_val_loss = logs["val_loss"][-1] if logs["val_loss"] else None
     summary_rows.append({
         "name": cfg.name,
         "status": r["status"],
         "steps": n,
-        "final_train_loss": f"{logs['train_loss'][-1]:.4f}" if n else "n/a",
-        "final_val_loss": f"{logs['val_loss'][-1]:.4f}" if logs["val_loss"] else "n/a",
+        "final_train_loss": f"{final_train_loss:.4f}" if final_train_loss is not None else "n/a",
+        "final_train_ppl": f"{_safe_ppl(final_train_loss):.2f}" if final_train_loss is not None else "n/a",
+        "final_val_loss": f"{final_val_loss:.4f}" if final_val_loss is not None else "n/a",
+        "final_val_ppl": f"{_safe_ppl(final_val_loss):.2f}" if final_val_loss is not None else "n/a",
         "mean_step_ms": f"{np.mean(logs['step_time_ms']):.1f}" if n else "n/a",
         "mean_tok/s": f"{np.mean(logs['tokens_per_s']):.0f}" if n else "n/a",
         "peak_cuda_MB": f"{np.nanmax(logs['cuda_mem_mb']):.1f}" if device.type == "cuda" and n else "n/a",
@@ -3387,6 +3569,7 @@ color_map = {
     "fp32": "C0", "fp16_naive": "C3", "bf16_naive": "C5",
     "amp_fp16_no_scaler": "C6", "amp_fp16": "C4", "amp_bf16": "C1",
     "amp_bf16_cpu": "C1",
+    "amp_fp16_mps": "C4", "amp_bf16_mps": "C1",
 }
 
 for r in results:
@@ -3588,6 +3771,72 @@ else:
     print("Need at least 2 completed experiments for summary charts.")
 """)
 
+md(r"""
+### 3.6.1 Sanity check: generate text from each trained model
+
+Loss curves are the real metric, but they're abstract. Since we're training a tiny **causal language model**, we can do a qualitative sanity check: generate a short continuation from a fixed prompt for each successfully trained regime.
+
+Notes:
+- This is **not** a rigorous evaluation — it's a learning aid.
+- We run generation in **FP32** for comparability (we're comparing the *trained weights*, not inference autocast).
+""")
+
+code(r"""
+# Text generation samples (one prompt per precision regime)
+
+@torch.no_grad()
+def generate(model, idx, max_new_tokens, temperature=1.0, top_k=None):
+    model.eval()
+    for _ in range(max_new_tokens):
+        idx_cond = idx[:, -model.block_size:]
+        logits = model(idx_cond)[:, -1, :] / max(float(temperature), 1e-8)
+        if top_k is not None:
+            v, _ = torch.topk(logits, int(top_k))
+            logits = logits.clone()
+            logits[logits < v[:, [-1]]] = -float("inf")
+        probs = F.softmax(logits, dim=-1)
+        next_id = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat([idx, next_id], dim=1)
+    return idx
+
+def safe_encode(s: str):
+    return [stoi[c] for c in s if c in stoi]
+
+PROMPT = "Autocast is "
+NEW_TOKENS = 240
+TEMPERATURE = 0.9
+TOP_K = 20
+
+set_seed(0)
+
+printed = 0
+for r in results:
+    if r["status"] != "ok":
+        continue
+    state = r.get("state_dict", None)
+    if state is None:
+        continue
+    cfg = r["config"]
+    m = TinyGPT(
+        vocab_size=vocab_size,
+        block_size=cfg.block_size,
+        n_layer=2,
+        n_embd=128,
+        n_heads=4,
+        dropout=0.0,
+    ).to(device).float()
+    m.load_state_dict(state)
+
+    idx0 = torch.tensor([safe_encode(PROMPT)], dtype=torch.long, device=device)
+    out = generate(m, idx0, NEW_TOKENS, temperature=TEMPERATURE, top_k=TOP_K)
+    text = decode_tokens(out[0].tolist())
+    print(f"\n=== {cfg.name} ===\n{text}")
+    printed += 1
+
+if printed == 0:
+    print("No successful runs to sample from.")
+""")
+
 
 md(r"""
 ## 3.7 Memory breakdown comparison (bytes per parameter)
@@ -3749,8 +3998,10 @@ md(r"""
 ## 3.9 Practical checklist
 
 ### Defaults that usually work
-- Prefer **BF16 autocast** if your GPU supports it (Ampere+). No GradScaler needed.
-- Otherwise use **FP16 autocast + GradScaler**.
+- **CUDA:** prefer **BF16 autocast** if your GPU supports it (Ampere+). No GradScaler needed.
+- **CUDA (no BF16):** use **FP16 autocast + GradScaler**.
+- **CPU:** use **BF16 autocast** (mostly for numerics; speedups depend on CPU/kernel support).
+- **MPS:** use **FP16 autocast** (operator coverage differs from CUDA; verify with probes in Section 3).
 - Keep optimizer state in FP32 (default for most PyTorch optimizers).
 
 ### When things go wrong
