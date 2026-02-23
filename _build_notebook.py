@@ -33,9 +33,21 @@ def code(src: str):
 md(r"""
 # Autocast / AMP in PyTorch: A Deep Practical Reference
 
-This notebook is a **learning tool** for understanding and *actually feeling* the impact of mixed-precision training.
+Every neural network is fundamentally a giant mathematical expression, and training is the process of tuning the constants (weights) so that expression approximates reality. We do this by computing a loss, backpropagating to get gradients, and nudging the weights a tiny bit in the right direction. Repeat billions of times.
 
-It is organized into **three sections**:
+But here's the thing: those weights and gradients are stored as **floating-point numbers**. And floating-point numbers are *not* real numbers. They are a finite approximation with a specific *resolution*. That resolution depends on the format — FP32, FP16, BF16, TF32, FP8 — and each format makes a different tradeoff between **range** (how large and small the numbers can get) and **precision** (how fine the steps between consecutive representable values are).
+
+This matters because during training, we routinely deal with numbers spanning many orders of magnitude: weights around $10^0$, gradients as small as $10^{-8}$, attention logits that can spike to $10^3$, and accumulations over thousands of values. A format that can't represent tiny gradients kills learning (they become zero). A format that can't represent large attention logits kills stability (they become infinity). A format that rounds too aggressively corrupts the running statistics that normalization layers depend on.
+
+The fundamental question this notebook answers is: **when can we get away with lower resolution, and when does it break training?**
+
+Autocast (AMP) is PyTorch's answer: a per-operation precision policy that routes each computation to the right format. Some ops get the speed of 16-bit. Some ops get the safety of 32-bit. The combined effect is faster training with (nearly) no loss in quality. But to understand *when* and *why* AMP works — and to debug it when it doesn't — you need to understand what floating-point formats can and cannot represent.
+
+That's what this notebook is for.
+
+---
+
+This notebook is organized into **three sections**:
 
 | # | Section | What you get |
 |---|---|---|
@@ -386,6 +398,90 @@ So: FP16 fails first due to **range** (underflow/overflow). BF16 fails first due
 Autocast exists to route computations so that you get the performance of 16-bit compute without the worst numeric failure modes.
 """)
 
+code(r"""
+# Visual bit layout: sign / exponent / mantissa for each format
+# This is the single most referenced diagram in floating-point explanations.
+
+formats_vis = [
+    ("FP64 (double)",     1, 11, 52, 64),
+    ("FP32 (single)",     1,  8, 23, 32),
+    ("TF32 (tensor)*",    1,  8, 10, 19),
+    ("BF16 (brain float)",1,  8,  7, 16),
+    ("FP16 (IEEE half)",  1,  5, 10, 16),
+    ("FP8 (E5M2)",        1,  5,  2,  8),
+    ("FP8 (E4M3)",        1,  4,  3,  8),
+]
+
+fig, ax = plt.subplots(figsize=(14, 5))
+
+y_positions = list(range(len(formats_vis)))[::-1]
+bar_height = 0.6
+max_bits = max(f[4] for f in formats_vis)
+
+for i, (name, s_bits, e_bits, m_bits, total) in enumerate(formats_vis):
+    y = y_positions[i]
+    # Scale bar width proportional to bit count (relative to max)
+    scale = 0.85  # fraction of plot width for the widest format
+    bit_width = scale / max_bits
+
+    # Draw sign bits
+    ax.barh(y, s_bits * bit_width, height=bar_height, left=0,
+            color="#e74c3c", edgecolor="white", linewidth=1.5, zorder=3)
+    # Draw exponent bits
+    ax.barh(y, e_bits * bit_width, height=bar_height, left=s_bits * bit_width,
+            color="#3498db", edgecolor="white", linewidth=1.5, zorder=3)
+    # Draw mantissa bits
+    ax.barh(y, m_bits * bit_width, height=bar_height, left=(s_bits + e_bits) * bit_width,
+            color="#2ecc71", edgecolor="white", linewidth=1.5, zorder=3)
+
+    # Labels inside bars
+    mid_s = s_bits * bit_width / 2
+    mid_e = (s_bits + e_bits / 2) * bit_width
+    mid_m = (s_bits + e_bits + m_bits / 2) * bit_width
+
+    fontsize = 8 if total >= 16 else 7
+    if s_bits >= 1:
+        ax.text(mid_s, y, f"S\n{s_bits}", ha="center", va="center", fontsize=6, fontweight="bold", color="white")
+    ax.text(mid_e, y, f"Exp\n{e_bits}", ha="center", va="center", fontsize=fontsize, fontweight="bold", color="white")
+    if m_bits >= 2:
+        ax.text(mid_m, y, f"Mantissa\n{m_bits}", ha="center", va="center", fontsize=fontsize, fontweight="bold", color="white")
+    else:
+        ax.text(mid_m, y, f"M{m_bits}", ha="center", va="center", fontsize=6, fontweight="bold", color="white")
+
+    # Format name and total bits on the left
+    ax.text(-0.02, y, f"{name}  [{total} bits]", ha="right", va="center", fontsize=9, fontweight="bold")
+
+ax.set_xlim(-0.55, max_bits * scale / max_bits + 0.05)
+ax.set_ylim(-0.5, len(formats_vis) - 0.5)
+ax.set_yticks([])
+ax.set_xticks([])
+ax.spines["top"].set_visible(False)
+ax.spines["right"].set_visible(False)
+ax.spines["bottom"].set_visible(False)
+ax.spines["left"].set_visible(False)
+ax.set_title("Floating-Point Bit Layouts: where the bits go", fontsize=13, fontweight="bold", pad=15)
+
+# Legend
+from matplotlib.patches import Patch
+legend_elements = [
+    Patch(facecolor="#e74c3c", edgecolor="white", label="Sign (1 bit)"),
+    Patch(facecolor="#3498db", edgecolor="white", label="Exponent (range)"),
+    Patch(facecolor="#2ecc71", edgecolor="white", label="Mantissa (precision)"),
+]
+ax.legend(handles=legend_elements, loc="lower right", fontsize=9, framealpha=0.9)
+
+plt.tight_layout()
+
+print("Key observations:")
+print("  - BF16 has the SAME exponent width as FP32 (8 bits) → same range → no underflow issues")
+print("  - FP16 has a NARROWER exponent (5 bits) but MORE mantissa than BF16 → better precision, worse range")
+print("  - TF32 combines FP32's exponent with FP16's mantissa width (10 bits) → internal to Tensor Cores")
+print("  - FP8 formats have tiny mantissa → need per-tensor scaling to be usable")
+print()
+print("* TF32 is 19 bits internally but is NOT a storage format. Tensor Cores use it transparently for FP32 matmuls.")
+""")
+
+
 md(r"""
 ## Mixed Precision / Autocast Regimes (PyTorch) — Cheat Sheet
 
@@ -591,7 +687,48 @@ print("FP16 has more mantissa bits (10) giving finer precision; BF16 has fewer (
 
 
 md(r"""
-### 1.1.2 Normal vs subnormal numbers (and "flush-to-zero")
+### 1.1.2 Why FP32 → BF16 conversion is trivial (but FP32 → FP16 is not)
+
+Since BF16 shares the same 8-bit exponent as FP32, converting FP32 to BF16 is just **truncating** (or rounding) the bottom 16 mantissa bits. The exponent field doesn't change, so no value can overflow or underflow during conversion.
+
+Converting FP32 to FP16, on the other hand, requires **narrowing the exponent** from 8 bits to 5 bits. This means:
+- FP32 values with exponents outside FP16's range (below $2^{-14}$ or above $2^{15}$) become 0 or `inf` during conversion.
+- The conversion itself can destroy values even before you do any computation.
+
+This is one reason BF16 is considered a "drop-in" replacement for FP32 in many training scenarios, while FP16 requires extra infrastructure (loss scaling, careful range management).
+""")
+
+code(r"""
+# FP32 → BF16 vs FP32 → FP16 conversion: what survives?
+
+test_values = [3.14159, 1e-6, 1e-10, 1e-30, 1e-38, 1e30, 65504.0, 65536.0, 1e38]
+
+rows = []
+for v in test_values:
+    fp32 = torch.tensor(v, dtype=torch.float32)
+    bf16 = fp32.to(torch.bfloat16)
+    fp16 = fp32.to(torch.float16)
+    rows.append({
+        "FP32 value": f"{v:.2e}",
+        "→ BF16": f"{float(bf16):.4e}",
+        "BF16 survived?": "inf/0" if not torch.isfinite(bf16) or float(bf16) == 0 and v != 0 else "YES",
+        "BF16 rel error": f"{abs(float(bf16) - v) / (abs(v) + 1e-45):.2e}" if torch.isfinite(bf16) and float(bf16) != 0 else "-",
+        "→ FP16": f"{float(fp16):.4e}",
+        "FP16 survived?": "inf" if torch.isinf(fp16) else ("0 (underflow)" if float(fp16) == 0 and v != 0 else "YES"),
+        "FP16 rel error": f"{abs(float(fp16) - v) / (abs(v) + 1e-45):.2e}" if torch.isfinite(fp16) and float(fp16) != 0 else "-",
+    })
+
+display(pd.DataFrame(rows))
+
+print("\nKey takeaway:")
+print("  BF16 preserves ALL magnitudes (same exponent range as FP32) — just loses some decimal precision.")
+print("  FP16 DESTROYS values outside its narrow range: 1e-10 underflows to 0, 65536 overflows to inf.")
+print("  This is why BF16 conversion is 'just truncate the mantissa' — safe and trivial.")
+""")
+
+
+md(r"""
+### 1.1.3 Normal vs subnormal numbers (and "flush-to-zero")
 
 **Subnormals** (also called denormals) extend the representable range closer to 0 by giving up the implicit leading `1.`:
 
@@ -629,7 +766,74 @@ pd.DataFrame(rows)
 
 
 md(r"""
-### 1.1.3 ULP: spacing grows with magnitude
+### 1.1.4 The measuring tape analogy
+
+A good way to think about floating-point formats is as a **measuring tape**:
+- The **length** of the tape is determined by the exponent bits (range: how big/small you can measure).
+- The **fineness of the tick marks** is determined by the mantissa bits (precision: how closely you can read off a value).
+
+FP32 is a long tape with fine tick marks. BF16 is equally long but with coarser tick marks. FP16 is a much shorter tape with tick marks finer than BF16 but coarser than FP32.
+
+For training, **tape length (range) matters more than tick mark fineness (precision)** — because a gradient that falls *off the tape entirely* (underflow to zero) provides zero learning signal, while a gradient that lands *between tick marks* (rounding) still provides a useful approximate signal. SGD is inherently noisy; it tolerates imprecise gradients, but it cannot learn from absent ones.
+""")
+
+code(r"""
+# The measuring tape: visualize range and precision as tape length vs tick density
+
+fig, axes = plt.subplots(3, 1, figsize=(14, 5), gridspec_kw={"hspace": 0.6})
+
+tape_configs = [
+    ("FP32 (8-bit exp, 23-bit mantissa)", torch.float32, "#2ecc71", -126, 127, 23),
+    ("BF16 (8-bit exp, 7-bit mantissa)",  torch.bfloat16, "#3498db", -126, 127, 7),
+    ("FP16 (5-bit exp, 10-bit mantissa)", torch.float16, "#e74c3c", -14, 15, 10),
+]
+
+for ax, (label, dt, color, exp_min, exp_max, mant_bits) in zip(axes, tape_configs):
+    # Draw the tape as a colored bar representing the exponent range
+    tape_left = exp_min
+    tape_right = exp_max
+    full_range = 127 - (-126)  # FP32 range for normalization
+
+    # Normalize to common axis
+    ax.barh(0, tape_right - tape_left, left=tape_left, height=0.4,
+            color=color, alpha=0.3, edgecolor=color, linewidth=2)
+
+    # Draw tick marks proportional to mantissa precision
+    # More mantissa bits = more ticks (denser)
+    n_ticks = min(2 ** mant_bits, 200)  # cap for visualization
+    tick_positions = np.linspace(tape_left, tape_right, n_ticks)
+    for tp in tick_positions:
+        ax.plot([tp, tp], [-0.15, 0.15], color=color, linewidth=0.3, alpha=0.6)
+
+    # Labels
+    ax.text(tape_left - 1, 0, label, ha="right", va="center", fontsize=9, fontweight="bold")
+    ax.text((tape_left + tape_right) / 2, -0.35,
+            f"Range: 2^{exp_min} to 2^{exp_max}  |  Precision: {2**mant_bits} levels per power-of-2",
+            ha="center", va="top", fontsize=8, color="gray")
+
+    ax.set_xlim(-140, 135)
+    ax.set_ylim(-0.5, 0.5)
+    ax.set_yticks([])
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_visible(False)
+    ax.set_xlabel("exponent (log2 scale)" if ax == axes[-1] else "")
+
+fig.suptitle("The Measuring Tape: Range (tape length) vs Precision (tick density)", fontsize=12, fontweight="bold", y=1.02)
+plt.tight_layout()
+
+print("Key insight:")
+print("  FP32 and BF16 have the SAME tape length (range) — they can measure the same extremes.")
+print("  FP16 has a MUCH SHORTER tape — values beyond 2^15 ≈ 65504 overflow to infinity,")
+print("  and values below 2^-14 ≈ 6e-5 underflow to zero.")
+print()
+print("  But BF16's tick marks are 8x coarser than FP16's (128 vs 1024 levels per interval).")
+print("  For training, this tradeoff overwhelmingly favors BF16: coarse ticks = noise, short tape = death.")
+""")
+
+
+md(r"""
+### 1.1.5 ULP: spacing grows with magnitude
 
 A float format has *roughly constant relative precision* but *variable absolute precision*.
 
@@ -665,7 +869,7 @@ plt.tight_layout();
 
 
 md(r"""
-### 1.1.4 Number line: where representable floats actually live
+### 1.1.6 Number line: where representable floats actually live
 
 The spacing between representable numbers is *not uniform* — it depends on the magnitude. Near zero, floats are dense; as magnitude grows, they spread apart. And crucially, **different formats have different densities at every scale**.
 
@@ -733,7 +937,7 @@ print("but FP16 has ~8,192x fewer than FP32. This is the precision-range tradeof
 
 
 md(r"""
-### 1.1.5 The bit-level addition trap (why `1 + 1e-4 = 1` in FP16)
+### 1.1.7 The bit-level addition trap (why `1 + 1e-4 = 1` in FP16)
 
 This is the single most important numeric fact for understanding **weight update stagnation**.
 
@@ -839,6 +1043,85 @@ print(f"1e-4 < eps?    {1e-4 < eps_f16}  → update is below FP16's resolution a
 print()
 print("Training implication: if weight ≈ 1.0 and lr × grad ≈ 1e-4,")
 print("the weight NEVER changes in FP16. This is weight update stagnation.")
+""")
+
+
+md(r"""
+### 1.1.8 Epsilon meets training: where do real weight updates fall?
+
+The addition trap is not theoretical — it directly determines whether training succeeds. Let's connect the abstract epsilon values to concrete training scenarios.
+
+For a weight $w$ stored in a given dtype, the **minimum detectable update** is approximately $|w| \times \epsilon$. If $\text{lr} \times |\text{grad}|$ is smaller than this, the weight never changes.
+
+Typical training setups use learning rates of $10^{-3}$ to $10^{-5}$, and gradient magnitudes often range from $10^{-2}$ to $10^{-6}$. Their product ($\text{lr} \times |\text{grad}|$) is what the format must be able to represent *relative to the weight magnitude*.
+""")
+
+code(r"""
+# Where do typical lr × grad products fall relative to epsilon boundaries?
+
+fig, ax = plt.subplots(figsize=(14, 5))
+
+# Epsilon values (minimum detectable relative update)
+epsilons = {
+    "FP16": float(torch.finfo(torch.float16).eps),
+    "BF16": float(torch.finfo(torch.bfloat16).eps),
+    "FP32": float(torch.finfo(torch.float32).eps),
+}
+
+# Typical lr × |grad| magnitudes in real training
+typical_updates = {
+    "lr=1e-3 × |g|=1e-1\n(early training, large grads)": 1e-4,
+    "lr=1e-3 × |g|=1e-3\n(mid training)": 1e-6,
+    "lr=1e-4 × |g|=1e-3\n(fine-tuning)": 1e-7,
+    "lr=1e-4 × |g|=1e-5\n(late training, small grads)": 1e-9,
+    "lr=1e-5 × |g|=1e-5\n(LLM fine-tune)": 1e-10,
+}
+
+y_pos = 0
+colors_eps = {"FP16": "#e74c3c", "BF16": "#3498db", "FP32": "#2ecc71"}
+
+# Draw epsilon boundaries as vertical lines
+for name, eps in epsilons.items():
+    ax.axvline(np.log10(eps), color=colors_eps[name], linewidth=3, alpha=0.7,
+               label=f"{name} epsilon = {eps:.1e}")
+
+# Shade the "safe update" zone (above all epsilons)
+ax.axvspan(np.log10(max(epsilons.values())), 0, alpha=0.05, color="green")
+
+# Draw typical update magnitudes as horizontal markers
+y_updates = np.linspace(0.9, 0.1, len(typical_updates))
+for (label, mag), y in zip(typical_updates.items(), y_updates):
+    marker_color = "green"
+    if mag < epsilons["FP16"]:
+        marker_color = "red"
+    elif mag < epsilons["BF16"]:
+        marker_color = "orange"
+    ax.plot(np.log10(mag), y, "D", color=marker_color, markersize=10, zorder=5)
+    ax.text(np.log10(mag) + 0.15, y, label, fontsize=7, va="center", color=marker_color)
+
+# Annotations
+ax.text(np.log10(epsilons["FP16"]) - 0.1, 0.95,
+        "← Updates here are LOST\n    in FP16 (weight never changes)",
+        fontsize=8, color="#e74c3c", ha="right", va="top", fontstyle="italic")
+ax.text(np.log10(epsilons["BF16"]) - 0.1, 0.5,
+        "← Also lost in BF16",
+        fontsize=8, color="#3498db", ha="right", va="center", fontstyle="italic")
+
+ax.set_xlim(-12, 0.5)
+ax.set_ylim(-0.05, 1.1)
+ax.set_xlabel("log10(lr × |gradient|)  — relative to weight magnitude of ~1.0", fontsize=10)
+ax.set_yticks([])
+ax.set_title("Where do real weight updates fall relative to format epsilon?", fontsize=12, fontweight="bold")
+ax.legend(loc="lower left", fontsize=9)
+plt.tight_layout()
+
+print("Interpretation:")
+print("  - Green diamonds: update is large enough for ALL formats")
+print("  - Orange diamonds: update works in FP32 and FP16, but NOT in BF16")
+print("  - Red diamonds: update only works in FP32")
+print()
+print("This is why FP32 master weights are essential: the optimizer applies updates in FP32")
+print("(where they're captured), then casts back to 16-bit for the next forward pass.")
 """)
 
 
@@ -2822,20 +3105,35 @@ code(r"""
 # Tiny corpus + character-level tokenizer
 
 corpus_lines = [
-    "Autocast is not a global cast. It is an operator policy.",
-    "Some ops run in lower precision for speed.",
-    "Some ops run in float32 for stability.",
-    "Loss scaling rescues fp16 gradients from underflow.",
-    "Bfloat16 usually has enough exponent range to avoid underflow.",
-    "Transformers amplify numeric issues via softmax, layernorm, and large reductions.",
-    "AMP exists to route the right operations to the right dtype.",
-    "Master weights in fp32 prevent update stagnation.",
-    "Optimizer state should be kept in fp32 for long-horizon accumulation.",
-    "The autocast operator policy is the decoder ring for debugging AMP.",
+    "Autocast is not a global cast. It is an operator policy that routes each operation to the right precision.",
+    "Some ops run in lower precision for speed. Matmuls and linear layers are the primary targets.",
+    "Some ops run in float32 for stability. Softmax, layer normalization, and cross entropy need full precision.",
+    "Loss scaling rescues fp16 gradients from underflow by multiplying the loss before backward.",
+    "Bfloat16 has the same exponent range as float32, which means gradients rarely underflow to zero.",
+    "Transformers amplify numeric issues because attention involves softmax over large logits.",
+    "Master weights in fp32 prevent update stagnation where small gradients get rounded away.",
+    "Optimizer state like Adam moments should be kept in fp32 for long-horizon accumulation stability.",
+    "The fundamental tradeoff in floating point is range versus precision and they cannot both be maximized.",
+    "FP16 has ten mantissa bits and five exponent bits giving it better precision but much narrower range.",
+    "BF16 has seven mantissa bits and eight exponent bits giving it the same range as FP32 but coarser precision.",
+    "Modern GPUs have tensor cores that execute sixteen bit matrix multiplications with fp32 accumulation.",
+    "A single training step involves forward pass, loss computation, backward pass, and optimizer update.",
+    "Gradient accumulation with mixed precision requires careful ordering of scale, backward, unscale, and step.",
+    "Dynamic loss scaling starts with a large scale factor and halves it whenever overflow is detected.",
+    "When the gradient scaler detects infinity or NaN values it skips the optimizer step entirely.",
+    "The ZeRO optimizer partitions parameters gradients and optimizer state across multiple GPUs.",
+    "Mixed precision training saves memory primarily through reduced activation storage not parameter storage.",
+    "For a model with one billion parameters Adam mixed precision training requires about sixteen gigabytes.",
+    "TF32 is not a storage format but an internal compute mode used by tensor cores on Ampere GPUs.",
+    "Epsilon is the smallest number that when added to one produces a result strictly greater than one.",
+    "Neural networks are robust to gradient noise because stochastic gradient descent is inherently noisy.",
+    "The residual connection in transformers promotes dtype from sixteen bit back to thirty two bit under autocast.",
+    "FP8 training requires explicit per tensor scaling because the representable range is extremely narrow.",
+    "Weight stagnation happens when the learning rate times gradient product is below the unit in last place.",
 ]
 
 corpus = "\n".join(corpus_lines).strip()
-corpus = corpus * 50  # repeat for more training data
+corpus = corpus * 30  # repeat for more training data
 
 chars = sorted(set(corpus))
 stoi = {ch: i for i, ch in enumerate(chars)}
@@ -3081,30 +3379,47 @@ display(pd.DataFrame(summary_rows))
 """)
 
 code(r"""
-# Plot: Training + Validation loss curves
+# Plot: Training + Validation loss curves (annotated)
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+color_map = {
+    "fp32": "C0", "fp16_naive": "C3", "bf16_naive": "C5",
+    "amp_fp16_no_scaler": "C6", "amp_fp16": "C4", "amp_bf16": "C1",
+    "amp_bf16_cpu": "C1",
+}
 
 for r in results:
     name = r["config"].name
     logs = r["logs"]
     suffix = f" ({r['status']})" if r["status"] != "ok" else ""
+    color = color_map.get(name, "C7")
+    ls = "--" if "naive" in name else "-"
     if logs["train_loss"]:
-        axes[0].plot(logs["step"], logs["train_loss"], label=f"{name}{suffix}", alpha=0.8)
+        axes[0].plot(logs["step"], logs["train_loss"], label=f"{name}{suffix}",
+                     alpha=0.85, color=color, linestyle=ls, linewidth=1.5 if "naive" not in name else 1.0)
     if logs["val_loss"]:
-        axes[1].plot(logs["val_step"], logs["val_loss"], marker="o", ms=4, label=f"{name}{suffix}", alpha=0.8)
+        axes[1].plot(logs["val_step"], logs["val_loss"], marker="o", ms=5, label=f"{name}{suffix}",
+                     alpha=0.85, color=color, linestyle=ls)
 
-axes[0].set_title("Training loss vs step")
+axes[0].set_title("Training loss vs step", fontsize=11)
 axes[0].set_xlabel("step")
 axes[0].set_ylabel("cross-entropy loss")
-axes[0].legend()
+axes[0].legend(fontsize=8, loc="upper right")
 
-axes[1].set_title("Validation loss (periodic eval)")
+axes[1].set_title("Validation loss (periodic eval)", fontsize=11)
 axes[1].set_xlabel("step")
 axes[1].set_ylabel("cross-entropy loss")
-axes[1].legend()
+axes[1].legend(fontsize=8, loc="upper right")
 
-plt.tight_layout();
+fig.suptitle("TinyGPT Training: How precision regime affects convergence", fontsize=13, fontweight="bold", y=1.02)
+plt.tight_layout()
+
+print("What to look for:")
+print("  - FP32 (solid blue): smooth reference curve")
+print("  - Naive FP16 (dashed red): may stagnate, diverge, or NaN")
+print("  - Naive BF16 (dashed olive): often converges — BF16 range prevents gradient death")
+print("  - AMP variants (solid): should track FP32 closely, showing that AMP preserves quality")
 """)
 
 code(r"""
@@ -3140,14 +3455,23 @@ for r in results:
     logs = r["logs"]
     if not logs["step"]:
         continue
-    plt.plot(logs["step"], logs["grad_norm"], label=name, alpha=0.7)
+    color = color_map.get(name, "C7")
+    ls = "--" if "naive" in name else "-"
+    plt.plot(logs["step"], logs["grad_norm"], label=name, alpha=0.75, color=color, linestyle=ls)
 
-plt.title("Gradient L2 norm vs step (after unscaling)")
+# Add FP16 min normal threshold line
+fi16 = torch.finfo(torch.float16)
+plt.axhline(float(fi16.tiny), color="red", ls=":", alpha=0.4, label=f"FP16 min normal ({fi16.tiny:.1e})")
+
+plt.title("Gradient L2 norm vs step (after unscaling)", fontsize=11)
 plt.xlabel("step")
 plt.ylabel("||grad||_2")
 plt.yscale("log")
-plt.legend()
-plt.tight_layout();
+plt.legend(fontsize=8)
+plt.tight_layout()
+
+print("If gradients fall below the FP16 min normal line, they underflow to zero in FP16.")
+print("BF16 gradients essentially never underflow (BF16 min normal ≈ 1.2e-38).")
 """)
 
 code(r"""
@@ -3229,20 +3553,7 @@ if len(completed) >= 2:
 
     # 1. Final training loss
     final_losses = [r["logs"]["train_loss"][-1] for r in completed]
-    colors = []
-    for r in completed:
-        if "naive" in r["config"].name and "bf16" in r["config"].name:
-            colors.append("C5")
-        elif "naive" in r["config"].name:
-            colors.append("C3")
-        elif "amp" in r["config"].name and "bf16" in r["config"].name:
-            colors.append("C1")
-        elif "amp" in r["config"].name:
-            colors.append("C4")
-        elif "fp32" in r["config"].name:
-            colors.append("C0")
-        else:
-            colors.append("C7")
+    colors = [color_map.get(r["config"].name, "C7") for r in completed]
 
     axes[0].bar(x_pos, final_losses, color=colors, alpha=0.8, edgecolor="black", linewidth=0.5)
     axes[0].set_xticks(x_pos)
