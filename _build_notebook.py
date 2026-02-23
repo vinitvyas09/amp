@@ -4827,6 +4827,167 @@ print("so the ~50% activation reduction from AMP translates to substantial GPU m
 
 
 md(r"""
+### 3.7.1 LLM-scale memory projections: when does AMP become mandatory?
+
+The TinyGPT numbers above are small. Let's project the fixed memory costs to real model sizes to see where AMP (and distributed training) become necessary.
+
+**Important caveat:** These projections show only **fixed-size memory** (parameters + gradients + optimizer state). Activation memory (which scales with batch size $\times$ sequence length $\times$ layers) adds significantly more, and that's where AMP's 50% savings on activations really matters.
+""")
+
+code(r"""
+# LLM-scale memory projections
+
+model_scales = {
+    "TinyGPT (this nb)": n_params,
+    "GPT-2 Small (125M)": 125_000_000,
+    "GPT-2 XL (1.5B)": 1_500_000_000,
+    "LLaMA-7B": 7_000_000_000,
+    "LLaMA-13B": 13_000_000_000,
+    "LLaMA-70B": 70_000_000_000,
+}
+
+rows = []
+for name, n in model_scales.items():
+    # AdamW: 2 FP32 moment buffers + FP32 params + FP32 grads = 16 B/param
+    std_gb = n * 16 / 1024**3
+    # AMP with AdamW: SAME fixed cost (AMP only saves on activations)
+    amp_gb = n * 16 / 1024**3
+    # Naive 16-bit: 2 param + 2 grad + 4 m + 4 v = ~12 B/param (optimizer still FP32-ish)
+    # ... or full naive: 2+2+2+2 = 8 B/param (risky)
+    naive_gb = n * 8 / 1024**3
+    # 8-bit optimizer: 4 param + 4 grad + 1 m + 1 v = ~10 B/param
+    opt8_gb = n * 10 / 1024**3
+
+    rows.append({
+        "Model": name,
+        "Params": f"{n / 1e6:.0f}M" if n < 1e9 else f"{n / 1e9:.1f}B",
+        "FP32+AdamW (GB)": f"{std_gb:.1f}",
+        "AMP+AdamW (GB)": f"{amp_gb:.1f}",
+        "Naive 16bit (GB)": f"{naive_gb:.1f}",
+        "AMP+8bit opt (GB)": f"{opt8_gb:.1f}",
+        "1x 24GB GPU?": "YES" if amp_gb < 22 else "NO",
+        "1x 80GB GPU?": "YES" if amp_gb < 75 else "NO",
+    })
+
+display(pd.DataFrame(rows))
+
+print("\nKey takeaways:")
+print("  - Standard AMP does NOT reduce fixed memory vs FP32 (both 16 B/param with AdamW)")
+print("  - A 7B model needs ~112 GB just for params+grads+optimizer (before activations!)")
+print("  - This exceeds even an 80GB A100 → distributed training (FSDP/ZeRO) is mandatory")
+print("  - 8-bit optimizers reduce fixed cost by ~37% (16 → 10 B/param)")
+print("  - The real AMP savings come from activations (50% reduction) + Tensor Core speedups")
+print()
+print("  Rule of thumb: you need roughly 4x the model size in GB for inference (FP32),")
+print("  and 16x for training with AdamW (params + grads + 2 moment buffers).")
+""")
+
+
+md(r"""
+### 3.7.2 Empirical activation memory: FP32 vs autocast (CUDA only)
+
+The theoretical analysis shows that activation memory halves under AMP. Let's verify this by measuring actual CUDA memory allocation during forward passes at different batch sizes.
+
+Activation memory scales with **batch_size $\times$ sequence_length $\times$ hidden_dim $\times$ num_layers**, so the savings from AMP become more significant as you scale up.
+""")
+
+code(r"""
+# Empirical activation memory measurement (CUDA only)
+
+if device.type == "cuda":
+    set_seed(0)
+
+    dtype_16_test = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    test_mem_configs = [
+        ("FP32 (no autocast)", torch.float32, False, None),
+        (f"AMP ({dtype_16_test})", torch.float32, True, dtype_16_test),
+        (f"Naive {dtype_16_test}", dtype_16_test, False, None),
+    ]
+
+    BLOCK_MEM = 64
+    BATCH_SIZES_MEM = [4, 16, 32, 64]
+
+    rows = []
+    for batch_size in BATCH_SIZES_MEM:
+        for cfg_name, param_dt, use_ac, ac_dt in test_mem_configs:
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
+
+                m_test = TinyGPT(vocab_size, BLOCK_MEM, n_layer=2, n_embd=128, n_heads=4, dropout=0.0)
+                m_test = m_test.to(device).to(param_dt)
+
+                torch.cuda.synchronize()
+                mem_model = torch.cuda.memory_allocated() / 1024**2
+
+                idx_test = torch.randint(0, vocab_size, (batch_size, BLOCK_MEM), device=device)
+                with amp_autocast(device, ac_dt, enabled=use_ac):
+                    logits_test = m_test(idx_test)
+                    loss_test = F.cross_entropy(
+                        logits_test.reshape(-1, logits_test.size(-1)),
+                        idx_test.roll(-1, dims=1).reshape(-1),
+                    )
+
+                torch.cuda.synchronize()
+                mem_after_fwd = torch.cuda.memory_allocated() / 1024**2
+                activation_mem = mem_after_fwd - mem_model
+
+                loss_test.backward()
+                torch.cuda.synchronize()
+                peak_mem = torch.cuda.max_memory_allocated() / 1024**2
+
+                rows.append({
+                    "batch": batch_size,
+                    "config": cfg_name,
+                    "model_MB": f"{mem_model:.1f}",
+                    "activation_MB": f"{activation_mem:.1f}",
+                    "peak_MB": f"{peak_mem:.1f}",
+                })
+
+                del m_test, logits_test, loss_test, idx_test
+                torch.cuda.empty_cache()
+            except Exception as e:
+                rows.append({
+                    "batch": batch_size,
+                    "config": cfg_name,
+                    "model_MB": "-",
+                    "activation_MB": "-",
+                    "peak_MB": f"error: {type(e).__name__}",
+                })
+
+    df_act_mem = pd.DataFrame(rows)
+    display(df_act_mem)
+
+    # Plot activation memory vs batch size for each config
+    fig, ax = plt.subplots(figsize=(10, 4))
+    for cfg_name, _, _, _ in test_mem_configs:
+        subset = df_act_mem[df_act_mem["config"] == cfg_name]
+        try:
+            bs_vals = subset["batch"].tolist()
+            act_vals = [float(v) for v in subset["activation_MB"].tolist()]
+            ax.plot(bs_vals, act_vals, marker="o", label=cfg_name, linewidth=2)
+        except (ValueError, TypeError):
+            pass
+    ax.set_xlabel("Batch size")
+    ax.set_ylabel("Activation memory (MB)")
+    ax.set_title("Activation memory vs batch size — AMP halves activation storage")
+    ax.legend()
+    plt.tight_layout()
+
+    print("\nKey observation:")
+    print("  Activation memory (the gap between model-loaded and after-forward) scales with batch size.")
+    print("  Under autocast, activations are stored in FP16/BF16 → roughly half the memory.")
+    print("  This is the PRIMARY memory benefit of AMP for training.")
+    print("  At large batch sizes and long sequences, this savings is substantial.")
+else:
+    print("CUDA not available. Activation memory profiling requires CUDA.")
+    print("Key point: autocast halves activation memory because intermediate tensors")
+    print("saved for backward are stored in FP16/BF16 instead of FP32.")
+""")
+
+
+md(r"""
 ## 3.8 Interpreting results
 
 ### Loss curves
