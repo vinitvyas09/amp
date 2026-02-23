@@ -3547,6 +3547,8 @@ Before the full training suite, we'll also do:
 - Step time + throughput (tokens/s)
 - CUDA peak memory (if CUDA)
 - GradScaler scale (for FP16 AMP)
+
+Implementation detail: we keep the tokenized corpus on the selected device and sample batches with vectorized indexing, so the step-time graphs are not dominated by Python loops or host→device copies.
 """)
 
 code(r"""
@@ -3843,13 +3845,16 @@ def train_one(cfg):
     tokens_per_step = cfg.batch_size * cfg.block_size
 
     for step in range(cfg.steps):
+        # GPU kernels are async; synchronize so step_time_ms reflects actual compute.
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         t0 = time.perf_counter()
         x, y = get_batch("train", cfg.batch_size, cfg.block_size)
         optimizer.zero_grad(set_to_none=True)
 
         with amp_autocast(device, cfg.amp_dtype, enabled=cfg.use_autocast):
             logits = model(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
 
         if not torch.isfinite(loss):
             status = "non_finite_loss"
@@ -3870,6 +3875,8 @@ def train_one(cfg):
             scaler.update()
             scale_val = float(scaler.get_scale())
 
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         dt = max(time.perf_counter() - t0, 1e-12)
         logs["step"].append(step)
         logs["train_loss"].append(float(loss))
