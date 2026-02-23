@@ -5053,6 +5053,45 @@ md(r"""
 """)
 
 md(r"""
+### 3.9.1 Decision tree: which precision regime should I use?
+
+```
+START
+  │
+  ├─ Is this inference only?
+  │   YES → autocast(dtype=bf16 or fp16) + inference_mode()
+  │          No GradScaler needed. Pick bf16 if supported.
+  │
+  ├─ Is this training?
+  │   │
+  │   ├─ Does your GPU support BF16? (Ampere+, TPU, recent AMD)
+  │   │   YES → autocast(dtype=bfloat16), NO GradScaler
+  │   │          Keep model params in FP32. Autocast handles per-op casting.
+  │   │          This is the simplest and most robust mixed-precision path.
+  │   │
+  │   ├─ GPU supports FP16 but NOT BF16? (Volta, Turing, older)
+  │   │   → autocast(dtype=float16) + GradScaler
+  │   │     Keep model params in FP32. GradScaler prevents gradient underflow.
+  │   │
+  │   ├─ CPU only?
+  │   │   → autocast(dtype=bfloat16) on CPU
+  │   │     Speedups vary by CPU. Mostly useful for numeric consistency with GPU training.
+  │   │
+  │   └─ Need maximum speed / memory savings beyond standard AMP?
+  │       → Consider: 8-bit optimizers, FP8 (H100+), gradient checkpointing,
+  │         FSDP/ZeRO for distributed, or combinations thereof.
+  │
+  └─ ALWAYS:
+      - Keep optimizer state in FP32 (default for PyTorch optimizers)
+      - Keep model parameters in FP32 (let autocast handle per-op casting)
+      - Make tensor dimensions multiples of 8 for Tensor Core alignment
+      - Put forward + loss inside autocast context; optimizer step OUTSIDE
+```
+
+**The most common mistake:** calling `model.half()` or `model.bfloat16()` and thinking that's "mixed precision." It's not — it's *uniform* low precision with no per-op safety policy. Use autocast instead.
+""")
+
+md(r"""
 ## 3.10 Real-world AMP patterns (copy/paste templates)
 
 This section is intentionally practical: patterns that show up once you move from a notebook demo to a real training run.
@@ -5109,11 +5148,18 @@ class MyFn(torch.autograd.Function):
 
 If you skip this, autocast may feed your op tensors in unexpected dtypes, and you'll get silent accuracy bugs or runtime errors.
 
-### 3.10.5 Inference is simpler than training
+### 3.10.5 Inference autocast: simpler than training
 
-For inference you usually only need:
-- `torch.inference_mode()` (or `no_grad()`)
-- `autocast(...)` (no GradScaler)
+For inference you only need `autocast` + `inference_mode` (no GradScaler):
+
+```python
+model.eval()
+with torch.inference_mode():
+    with autocast(device_type="cuda", dtype=torch.bfloat16):
+        output = model(input_ids)
+```
+
+The benefit: matmuls run on Tensor Cores (faster) and activations are 16-bit (less memory), letting you serve larger batches or longer sequences. No gradient-related concerns.
 
 ### 3.10.6 Troubleshooting table
 
