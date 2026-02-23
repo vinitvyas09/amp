@@ -386,6 +386,65 @@ So: FP16 fails first due to **range** (underflow/overflow). BF16 fails first due
 Autocast exists to route computations so that you get the performance of 16-bit compute without the worst numeric failure modes.
 """)
 
+md(r"""
+## Mixed Precision / Autocast Regimes (PyTorch) — Cheat Sheet
+
+This is the "optimizer table" equivalent for AMP: a small set of regimes that cover most real training setups.
+
+**Rule of thumb (training):**
+- If you have CUDA + BF16 support → use **BF16 autocast** (usually no GradScaler).
+- Else if you have CUDA → use **FP16 autocast + GradScaler**.
+- Avoid `model.half()` / "everything FP16" for training unless you're deliberately doing it (it removes autocast's safety policy and makes optimizer math low precision).
+
+| Regime (common name) | What you set | What runs in 16-bit | What stays FP32 (by policy) | Loss scaling | Typical outcome |
+|---|---|---|---|---|---|
+| **FP32 baseline** | model params FP32, autocast OFF | nothing | everything | no | stable, slower |
+| **FP32 + TF32 matmuls** | Ampere+ default unless disabled | matmuls use **TF32** internally | everything else FP32 | no | stable + faster, but matmul precision is ~FP16 mantissa |
+| **AMP BF16 (recommended if supported)** | model params FP32, `autocast(dtype=bf16)` | matmuls / linears / convs | softmax / layernorm / losses / big reductions | no | stable + fast (range like FP32) |
+| **AMP FP16 + GradScaler** | model params FP32, `autocast(dtype=fp16)` + `GradScaler` | matmuls / linears / convs | softmax / layernorm / losses / big reductions | **yes** | stable + fast (but FP16 gradients need scaling) |
+| **Naive BF16** | model params BF16, autocast OFF | everything | almost nothing | no | often "works", but sensitive ops can drift (reductions/normalization) |
+| **Naive FP16** | model params FP16, autocast OFF | everything | almost nothing | maybe (manual) | frequently unstable (underflow/overflow + update stagnation) |
+
+**Key idea:** autocast is useful even if you *could* run everything in BF16/FP16 — it keeps the numerically sensitive operations in FP32.
+""")
+
+code(r"""
+# Suggest an AMP recipe for THIS machine
+
+def recommend_amp_recipe(dev: torch.device):
+    rec = {"device": dev.type}
+    if dev.type == "cuda":
+        bf16_ok = torch.cuda.is_bf16_supported()
+        rec["bf16_supported"] = bool(bf16_ok)
+        if bf16_ok:
+            rec["recommended_autocast_dtype"] = "bfloat16"
+            rec["use_grad_scaler"] = False
+            rec["why"] = "BF16 has FP32-like exponent range → underflow is rare."
+        else:
+            rec["recommended_autocast_dtype"] = "float16"
+            rec["use_grad_scaler"] = True
+            rec["why"] = "FP16 has narrow exponent range → GradScaler rescues gradients from underflow."
+        rec["note"] = "Keep model parameters in FP32; let autocast choose per-op dtypes."
+    elif dev.type == "cpu":
+        rec["recommended_autocast_dtype"] = "bfloat16"
+        rec["use_grad_scaler"] = False
+        rec["why"] = "CPU autocast supports BF16; speedups vary by CPU/kernel support."
+        rec["note"] = "CPU demos here are mostly about numerics, not performance."
+    elif dev.type == "mps":
+        rec["recommended_autocast_dtype"] = "float16"
+        rec["use_grad_scaler"] = False
+        rec["why"] = "MPS typically uses FP16 for reduced precision."
+        rec["note"] = "Operator coverage differs from CUDA; verify dtype behavior with the probes in Section 3."
+    else:
+        rec["recommended_autocast_dtype"] = "float32"
+        rec["use_grad_scaler"] = False
+        rec["why"] = "Unknown device type."
+        rec["note"] = ""
+    return rec
+
+display(pd.DataFrame([recommend_amp_recipe(device)]))
+""")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SECTION 1 — THEORY
@@ -2033,7 +2092,7 @@ plt.tight_layout();
 
 
 md(r"""
-### 3.1.7 What to observe
+### 3.1.6 What to observe
 
 **Loss curves:**
 - FP32 baseline should decrease smoothly.
@@ -2599,6 +2658,100 @@ print(f"Fraction that would underflow in BF16: {bf16_underflow_frac:.4f} ({bf16_
 print(f"\nThis is why FP16 needs loss scaling and BF16 usually doesn't.")
 """)
 
+md(r"""
+### 3.4.3 Dynamic loss scaling (GradScaler) in action
+
+Loss scaling has two failure modes:
+
+- **Scale too small** → doesn't rescue underflow (gradients still become 0 in FP16).
+- **Scale too large** → causes overflow (gradients become `inf`/`nan`).
+
+`GradScaler` automates this tradeoff: it tries to keep the scale as large as possible *without* overflow.
+
+In this demo we intentionally start with an absurdly large scale to trigger overflows, and watch GradScaler back off and skip optimizer steps.
+""")
+
+code(r"""
+# GradScaler overflow + step skipping demo (CUDA only)
+
+if device.type != "cuda":
+    print("Run on CUDA to see GradScaler dynamically adjust scale and skip steps.")
+else:
+    set_seed(0)
+    torch.cuda.synchronize()
+
+    model = nn.Linear(256, 256, bias=False).to(device).float()
+    opt = torch.optim.SGD(model.parameters(), lr=1e-3)
+
+    # Large inputs to create large (but finite) gradients.
+    x = (torch.randn(256, 256, device=device) * 5000).float()
+
+    try:
+        scaler = GradScaler(
+            init_scale=2**16,
+            growth_factor=2.0,
+            backoff_factor=0.5,
+            growth_interval=2,
+            enabled=True,
+        )
+    except TypeError:
+        scaler = GradScaler(enabled=True)
+        print("[warn] GradScaler init args not supported on this version; using defaults.")
+
+    logs = []
+    for step in range(12):
+        opt.zero_grad(set_to_none=True)
+        scale_before = float(scaler.get_scale()) if hasattr(scaler, "get_scale") else float("nan")
+
+        with amp_autocast(device, torch.float16, enabled=True):
+            y = model(x)  # FP16 matmul compute under autocast
+            # Force loss computation in FP32 to avoid forward overflow; we want overflow from scaling.
+            loss = (y.float() ** 2).mean()
+
+        scaler.scale(loss).backward()
+
+        # Unscale so we can inspect gradients in their true magnitude (and clip here if desired).
+        scaler.unscale_(opt)
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        found_inf = bool(any((~torch.isfinite(g)).any().item() for g in grads))
+        max_abs_grad = float(torch.stack([g.detach().abs().max() for g in grads]).max())
+
+        w_before = model.weight.detach().float().clone()
+        scaler.step(opt)     # skipped if found_inf=True
+        scaler.update()
+        w_after = model.weight.detach().float()
+
+        scale_after = float(scaler.get_scale()) if hasattr(scaler, "get_scale") else float("nan")
+        step_ran = bool((w_after - w_before).abs().max().item() != 0.0)
+
+        logs.append({
+            "step": step,
+            "loss(fp32)": float(loss.detach().cpu()),
+            "scale_before": scale_before,
+            "found_inf": found_inf,
+            "optimizer_step_ran": step_ran,
+            "max_abs_grad(after_unscale)": max_abs_grad,
+            "scale_after": scale_after,
+        })
+
+    df = pd.DataFrame(logs)
+    display(df)
+
+    fig, ax = plt.subplots(figsize=(12, 3))
+    ax.plot(df["step"], df["scale_before"], marker="o", label="scale_before")
+    ax.plot(df["step"], df["scale_after"], marker="o", ls="--", label="scale_after")
+    ax.set_yscale("log")
+    ax.set_xlabel("step")
+    ax.set_ylabel("scale (log)")
+    ax.set_title("GradScaler: backoff on overflow + step skipping")
+    ax.legend()
+
+    ax2 = ax.twinx()
+    ax2.plot(df["step"], df["found_inf"].astype(int), color="red", alpha=0.3, lw=2, label="found_inf")
+    ax2.set_ylabel("found_inf (0/1)")
+    plt.tight_layout();
+""")
+
 
 # ── 3.5 Weight update stagnation ────────────────────────────────────────────
 
@@ -3126,13 +3279,20 @@ else:
 
 
 md(r"""
-## 3.7 Memory breakdown comparison
+## 3.7 Memory breakdown comparison (bytes per parameter)
 
-Mixed precision reduces activation memory (which scales with batch size and sequence length) but still requires FP32 for optimizer state and master weights. Here's a rough breakdown for our TinyGPT.
+For LLM-scale training, it helps to separate memory into:
+
+- **Fixed-size memory** (scales with number of parameters): parameters + gradients + optimizer state (+ optional master weights).
+- **Activation memory** (scales with batch size × sequence length × layers): intermediate tensors saved for backward.
+
+AMP/autocast primarily helps with **activation memory** (and speed). With AdamW, the fixed-size **bytes/parameter** are often **~16 bytes/param** in both FP32 and "standard AMP" because optimizer state dominates.
+
+We'll compute the fixed-size accounting for a few common patterns and show what that looks like for our TinyGPT.
 """)
 
 code(r"""
-# Memory breakdown analysis
+# Fixed-size memory breakdown analysis (parameters + grads + optimizer state)
 
 def count_params(model):
     return sum(p.numel() for p in model.parameters())
@@ -3142,42 +3302,85 @@ n_params = count_params(model_tmp)
 del model_tmp
 
 rows = []
-for name, param_bytes, grad_bytes, optstate_bytes_per_param, notes in [
-    ("Pure FP32",       4, 4, 8, "Adam: m(4B) + v(4B)"),
-    ("Pure FP16",       2, 2, 4, "Adam: m(2B) + v(2B) — UNSTABLE"),
-    ("AMP FP16 (std)",  4, 4, 8, "Params+grads+opt in FP32; compute in FP16"),
-    ("AMP FP16 (with master wts)", 6, 2, 8, "FP16 params(2B) + FP32 master(4B)"),
-    ("AMP BF16 (std)",  4, 4, 8, "Params+grads+opt in FP32; compute in BF16"),
-]:
-    param_mb = n_params * param_bytes / 1024**2
-    grad_mb = n_params * grad_bytes / 1024**2
-    opt_mb = n_params * optstate_bytes_per_param / 1024**2
-    total_mb = param_mb + grad_mb + opt_mb
+configs = [
+    # AdamW has 2 FP32 moment buffers by default: m and v (8 bytes/param).
+    {
+        "config": "FP32 AdamW (baseline)",
+        "param_B": 4, "master_B": 0, "grad_B": 4, "opt_B": 8,
+        "notes": "Params/grads/Adam moments all FP32",
+    },
+    {
+        "config": "PyTorch AMP FP16 (compute)",
+        "param_B": 4, "master_B": 0, "grad_B": 4, "opt_B": 8,
+        "notes": "Typical AMP: params/grads/state FP32; matmuls run in FP16 under autocast",
+    },
+    {
+        "config": "PyTorch AMP BF16 (compute)",
+        "param_B": 4, "master_B": 0, "grad_B": 4, "opt_B": 8,
+        "notes": "Typical AMP: params/grads/state FP32; matmuls run in BF16 under autocast",
+    },
+    {
+        "config": "Naive FP16 AdamW (NOT recommended)",
+        "param_B": 2, "master_B": 0, "grad_B": 2, "opt_B": 4,
+        "notes": "Small fixed memory, but numerically fragile (underflow/overflow + low-precision optimizer state)",
+    },
+    {
+        "config": "Naive BF16 AdamW (sometimes works)",
+        "param_B": 2, "master_B": 0, "grad_B": 2, "opt_B": 4,
+        "notes": "Often trains, but sensitive reductions/normalizations can drift without an FP32 policy",
+    },
+    {
+        "config": "FP16 params + FP32 master + FP32 AdamW (classic mixed precision)",
+        "param_B": 2, "master_B": 4, "grad_B": 2, "opt_B": 8,
+        "notes": "Common in some stacks: FP16 model copy + FP32 master weights + FP32 optimizer moments",
+    },
+]
+
+for cfg in configs:
+    total_B = int(cfg["param_B"] + cfg["master_B"] + cfg["grad_B"] + cfg["opt_B"])
+    param_mb = n_params * cfg["param_B"] / 1024**2
+    master_mb = n_params * cfg["master_B"] / 1024**2
+    grad_mb = n_params * cfg["grad_B"] / 1024**2
+    opt_mb = n_params * cfg["opt_B"] / 1024**2
+    total_mb = param_mb + master_mb + grad_mb + opt_mb
     rows.append({
-        "config": name,
-        "param_memory_MB": f"{param_mb:.1f}",
-        "grad_memory_MB": f"{grad_mb:.1f}",
-        "optimizer_state_MB": f"{opt_mb:.1f}",
-        "total_fixed_MB": f"{total_mb:.1f}",
-        "notes": notes,
+        "config": cfg["config"],
+        "bytes_per_param": total_B,
+        "param_MB": float(f"{param_mb:.3f}"),
+        "master_MB": float(f"{master_mb:.3f}"),
+        "grad_MB": float(f"{grad_mb:.3f}"),
+        "optimizer_MB": float(f"{opt_mb:.3f}"),
+        "total_fixed_MB": float(f"{total_mb:.3f}"),
+        "notes": cfg["notes"],
     })
 
 print(f"TinyGPT parameters: {n_params:,}")
-print(f"(Real LLM savings come from activations, which scale with batch*seq_len)\n")
-display(pd.DataFrame(rows))
+print("Fixed-size bytes/param = params + master + grads + optimizer state (activations NOT included).")
+print("(Real LLM AMP savings come mostly from activations, which scale with batch×seq_len.)\n")
 
-# Visualize memory breakdown as stacked bar chart
+df_mem = pd.DataFrame(rows)
+display(df_mem)
+
+# Visualize fixed memory breakdown as stacked bar chart
 fig, ax = plt.subplots(figsize=(12, 4))
 x = np.arange(len(rows))
 w = 0.5
-names_m = [r["config"] for r in rows]
-param_mb = [float(r["param_memory_MB"]) for r in rows]
-grad_mb = [float(r["grad_memory_MB"]) for r in rows]
-opt_mb = [float(r["optimizer_state_MB"]) for r in rows]
+names_m = df_mem["config"].tolist()
+param_mb = df_mem["param_MB"].tolist()
+master_mb = df_mem["master_MB"].tolist()
+grad_mb = df_mem["grad_MB"].tolist()
+opt_mb = df_mem["optimizer_MB"].tolist()
 
-ax.bar(x, param_mb, w, label="Parameters", color="C0", alpha=0.8)
-ax.bar(x, grad_mb, w, bottom=param_mb, label="Gradients", color="C1", alpha=0.8)
-ax.bar(x, opt_mb, w, bottom=[p+g for p,g in zip(param_mb, grad_mb)], label="Optimizer state", color="C2", alpha=0.8)
+ax.bar(x, param_mb, w, label="Model params", color="C0", alpha=0.8)
+ax.bar(x, master_mb, w, bottom=param_mb, label="Master params", color="C4", alpha=0.8)
+ax.bar(x, grad_mb, w, bottom=[p+m for p,m in zip(param_mb, master_mb)], label="Gradients", color="C1", alpha=0.8)
+ax.bar(
+    x, opt_mb, w,
+    bottom=[p+m+g for p,m,g in zip(param_mb, master_mb, grad_mb)],
+    label="Optimizer state",
+    color="C2",
+    alpha=0.8,
+)
 ax.set_xticks(x)
 ax.set_xticklabels(names_m, rotation=25, ha="right", fontsize=8)
 ax.set_ylabel("Memory (MB)")
@@ -3250,6 +3453,80 @@ md(r"""
 - Gradient clipping should happen **after** `scaler.unscale_(optimizer)`.
 - `autocast` should cover forward + loss, but **not** the optimizer step.
 - On Ampere+ GPUs, your "FP32 baseline" may use TF32 for matmuls. Check `torch.backends.cuda.matmul.allow_tf32`.
+""")
+
+md(r"""
+## 3.10 Real-world AMP patterns (copy/paste templates)
+
+This section is intentionally practical: patterns that show up once you move from a notebook demo to a real training run.
+
+### 3.10.1 Gradient accumulation (microbatches)
+
+If you do gradient accumulation, the safest pattern is:
+
+```python
+scaler = GradScaler()
+optimizer.zero_grad(set_to_none=True)
+
+for micro in range(grad_accum_steps):
+    with autocast(device_type="cuda", dtype=torch.float16):
+        loss = loss_fn(model(x_micro), y_micro)
+        loss = loss / grad_accum_steps      # IMPORTANT: normalize
+    scaler.scale(loss).backward()
+
+scaler.unscale_(optimizer)                  # IMPORTANT: before clipping / inspecting grads
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
+scaler.step(optimizer)
+scaler.update()
+```
+
+### 3.10.2 Gradient clipping with FP16 AMP
+
+Clipping should happen **after** `scaler.unscale_(optimizer)`. If you clip *scaled* gradients, you're clipping the wrong numbers.
+
+### 3.10.3 Multiple optimizers / parameter groups
+
+Use **one scaler**. Call `scaler.step(optimizer_i)` for each optimizer, then `scaler.update()` once per iteration.
+
+### 3.10.4 Custom `autograd.Function` / custom ops
+
+If you write custom autograd functions (or CUDA extensions), make them autocast-safe. In PyTorch there are decorators for this (API varies by version):
+
+```python
+try:
+    from torch.amp import custom_fwd, custom_bwd
+except Exception:
+    from torch.cuda.amp import custom_fwd, custom_bwd
+
+class MyFn(torch.autograd.Function):
+    @staticmethod
+    @custom_fwd(cast_inputs=torch.float16)
+    def forward(ctx, x, w):
+        ...
+
+    @staticmethod
+    @custom_bwd
+    def backward(ctx, grad_out):
+        ...
+```
+
+If you skip this, autocast may feed your op tensors in unexpected dtypes, and you'll get silent accuracy bugs or runtime errors.
+
+### 3.10.5 Inference is simpler than training
+
+For inference you usually only need:
+- `torch.inference_mode()` (or `no_grad()`)
+- `autocast(...)` (no GradScaler)
+
+### 3.10.6 Troubleshooting table
+
+| Symptom | Likely cause | Quick check | Fix |
+|---|---|---|---|
+| Loss becomes `nan`/`inf` quickly | overflow in activations (attention logits, exp/log) or too-high LR | check `torch.isfinite(loss)`; watch GradScaler `found_inf`/scale drops | lower LR, add grad clipping, prefer BF16, check initialization |
+| Gradients mostly 0 in FP16 | underflow | measure `zero_grad_frac` or histogram of `log10(|grad|)` | use GradScaler (bigger initial scale), or switch to BF16 |
+| GradScaler scale keeps collapsing | frequent overflow events | scale drops + many skipped steps | lower LR, clip grads, check for unstable ops, switch to BF16 |
+| Training "does nothing" | weight update below ULP (stagnation) | log `max(|w_{t+1}-w_t|)` in model dtype | keep FP32 master weights (standard in AMP), avoid FP16 optimizer state |
+| No speedup from AMP | model too small, CPU-bound, or bad matmul shapes | compare tokens/s; check shapes are multiples of 8 | increase batch/seq, use Tensor Core-friendly dims, benchmark with realistic sizes |
 """)
 
 
