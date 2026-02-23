@@ -104,6 +104,8 @@ This notebook is organized into **three sections**:
 - **Non-associativity**: why summation order matters in low precision
 - **Catastrophic cancellation**: why LayerNorm/BatchNorm need FP32
 - **Kahan summation**: the compensated-sum fix
+- **TF32**: the format you're using without knowing it
+- **Tensor Core mechanics**: why mixed precision is fast (tile-based MMA, dimension alignment)
 - What AMP is (autocast + grad scaling)
 - Master weights, optimizer state, and accumulation
 
@@ -153,11 +155,11 @@ md(r"""
 You need:
 - Python 3.10+
 - PyTorch 2.x
-- `matplotlib`, `numpy`, `pandas`
+- `matplotlib`, `numpy`, `pandas`, `tqdm`
 
 ### Install (CPU-only quick start)
 ```bash
-pip install torch numpy pandas matplotlib
+pip install torch numpy pandas matplotlib tqdm
 ```
 
 ### Install (CUDA)
@@ -193,6 +195,11 @@ try:
     import matplotlib.ticker as ticker
 except ModuleNotFoundError as e:
     raise ModuleNotFoundError("Missing dependency: matplotlib. Install with: pip install matplotlib") from e
+
+try:
+    from tqdm.auto import tqdm
+except ModuleNotFoundError as e:
+    raise ModuleNotFoundError("Missing dependency: tqdm. Install with: pip install tqdm") from e
 
 from IPython.display import display
 
@@ -1143,6 +1150,154 @@ print("(where they're captured), then casts back to 16-bit for the next forward 
 
 
 md(r"""
+### 1.1.9 TF32: the format you're using without knowing it
+
+**TF32 (TensorFloat-32)** is an NVIDIA format introduced with the Ampere architecture (A100, 2020). It is *not* a storage format — you never create a TF32 tensor. Instead, Tensor Cores silently use TF32 arithmetic when you run FP32 matmuls on Ampere+ GPUs.
+
+**Bit layout (19 bits total):**
+
+| Component | Bits |
+|---|---|
+| Sign | 1 |
+| Exponent | 8 (same as FP32) |
+| Mantissa | 10 (same as FP16) |
+
+This gives TF32 the **range of FP32** (exponent $[-126, 127]$, max $\sim 3.4 \times 10^{38}$) with the **precision of FP16** (10 mantissa bits, $\epsilon \approx 9.77 \times 10^{-4}$).
+
+**Why this matters:**
+- On Ampere+ GPUs, `torch.backends.cuda.matmul.allow_tf32` defaults to `True`.
+- Your "FP32 baseline" is **secretly TF32** for all matmuls (Linear layers, attention projections, etc.).
+- Non-matmul ops (LayerNorm, softmax, element-wise) still use full FP32 precision.
+- This is actually a reasonable default: matmuls with FP32 accumulation tolerate reduced input precision well, and TF32 is ~8× faster than strict FP32 on Tensor Cores.
+
+**The practical implication:** When you compare "FP32 vs AMP" on Ampere+ GPUs, you're really comparing "TF32 matmuls + FP32 everything else" vs "FP16/BF16 matmuls + FP32 sensitive ops." The gap is smaller than you might expect.
+""")
+
+code(r"""
+# TF32 demo: measure the precision impact of TF32 on matmul
+
+if device.type == "cuda":
+    M = 1024
+    a = torch.randn(M, M, device=device, dtype=torch.float32)
+    b = torch.randn(M, M, device=device, dtype=torch.float32)
+
+    # Reference: strict FP32 (TF32 disabled)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    ref = a @ b
+
+    # TF32 enabled
+    torch.backends.cuda.matmul.allow_tf32 = True
+    out_tf32 = a @ b
+
+    # FP64 reference for absolute ground truth
+    ref64 = (a.double() @ b.double()).float()
+
+    def _rel_err(x, ref):
+        return float((x - ref).abs().mean() / (ref.abs().mean() + 1e-12))
+
+    err_strict = _rel_err(ref, ref64)
+    err_tf32 = _rel_err(out_tf32, ref64)
+
+    print("Matmul precision comparison (1024x1024, vs FP64 reference):")
+    print(f"  Strict FP32:  mean relative error = {err_strict:.2e}")
+    print(f"  TF32 enabled: mean relative error = {err_tf32:.2e}")
+    print(f"  TF32 / FP32 error ratio: {err_tf32 / max(err_strict, 1e-20):.1f}x")
+    print()
+    print(f"  TF32 matmul default: torch.backends.cuda.matmul.allow_tf32 = {torch.backends.cuda.matmul.allow_tf32}")
+    print()
+    print("Key insight: TF32 introduces ~1000x more error than strict FP32, but this is still")
+    print("small enough (~1e-4 relative) that training is unaffected. The 8x Tensor Core speedup")
+    print("makes this an excellent default tradeoff.")
+    print()
+    print("To disable TF32 for strict FP32 comparisons:")
+    print("  torch.backends.cuda.matmul.allow_tf32 = False")
+    print("  torch.backends.cudnn.allow_tf32 = False")
+else:
+    print("TF32 is an NVIDIA Ampere+ GPU feature. Not applicable on this device.")
+    print("On CUDA Ampere+ GPUs, FP32 matmuls silently use TF32 (10-bit mantissa)")
+    print("by default, giving ~8x speedup with ~FP16-level precision.")
+""")
+
+
+md(r"""
+### 1.1.10 Tensor Core mechanics: why mixed precision is fast
+
+Modern GPU speedups from mixed precision come from **Tensor Cores** — specialized hardware units that perform tile-based matrix-multiply-accumulate (MMA) operations.
+
+**How Tensor Cores work:**
+
+1. **Tile-based:** Tensor Cores operate on small tiles (e.g., 16×16×16 for FP16 on Volta/Turing, 16×8×16 on Ampere). The GPU's warp scheduler feeds tiles from the input matrices to Tensor Cores.
+2. **Mixed-precision accumulation:** Inputs are FP16/BF16 (or TF32/FP8), but the **accumulation** (partial sums) happens in **FP32**. This is why matmuls under autocast are both fast *and* numerically reasonable.
+3. **Result:** $D = A \times B + C$ where $A$, $B$ are low-precision and $C$, $D$ are FP32 accumulators.
+
+**Dimension alignment matters:**
+
+Tensor Cores achieve maximum throughput when matrix dimensions are **multiples of 8** (for FP16/BF16) or **multiples of 16** (for FP8/INT8). Misaligned dimensions force the GPU to pad or fall back to slower CUDA cores.
+
+This is why you'll see guidance like:
+- Embedding dimensions: use multiples of 64 or 128
+- Vocabulary size: pad to a multiple of 8
+- Batch size: prefer multiples of 8
+
+The code below demonstrates the speedup difference between aligned and misaligned dimensions.
+""")
+
+code(r"""
+# Tensor Core alignment benchmark: aligned vs misaligned dimensions
+
+if device.type == "cuda":
+    import torch.utils.benchmark as benchmark
+
+    def bench_matmul(M, K, N, dtype, label):
+        a = torch.randn(M, K, device=device, dtype=dtype)
+        b = torch.randn(K, N, device=device, dtype=dtype)
+        # Warmup
+        for _ in range(10):
+            _ = a @ b
+        torch.cuda.synchronize()
+        t = benchmark.Timer(
+            stmt="a @ b",
+            globals={"a": a, "b": b},
+        )
+        m = t.blocked_autorange(min_run_time=0.5)
+        return m.median * 1e6  # microseconds
+
+    rows = []
+    for label, M, K, N in [
+        ("Aligned (512×512×512)", 512, 512, 512),
+        ("Misaligned (511×513×509)", 511, 513, 509),
+        ("Aligned (1024×1024×1024)", 1024, 1024, 1024),
+        ("Misaligned (1023×1025×1021)", 1023, 1025, 1021),
+    ]:
+        for dtype, dname in [(torch.float32, "FP32"), (torch.float16, "FP16"), (torch.bfloat16, "BF16")]:
+            if not supports_dtype_on_device(dtype, device):
+                continue
+            us = bench_matmul(M, K, N, dtype, label)
+            rows.append({"shape": label, "dtype": dname, "time_us": f"{us:.0f}"})
+
+    df_tc = pd.DataFrame(rows)
+    # Pivot for readability
+    if len(df_tc) > 0:
+        pivot = df_tc.pivot(index="shape", columns="dtype", values="time_us")
+        print("Matmul time (microseconds) — aligned vs misaligned dimensions:")
+        display(pivot)
+        print()
+        print("Aligned dimensions (multiples of 8) allow Tensor Cores to operate at full throughput.")
+        print("Misaligned dimensions may cause padding overhead or fallback to slower CUDA cores.")
+        print()
+        print("Practical rule: make embedding dim, hidden dim, vocab size, and batch size multiples of 8.")
+else:
+    print("Tensor Core benchmarks require CUDA. Skipping on this device.")
+    print()
+    print("Key takeaways for Tensor Cores:")
+    print("  1. They perform tile-based MMA (matrix-multiply-accumulate) on small blocks (e.g. 16x16)")
+    print("  2. Inputs are FP16/BF16, accumulation is FP32 — this is why autocast matmuls are accurate")
+    print("  3. Matrix dimensions should be multiples of 8 for optimal Tensor Core utilization")
+    print("  4. Speedup is typically 2-8x over standard FP32 CUDA cores")
+""")
+
+
+md(r"""
 ## 1.2 FP16 vs BF16 vs FP32: the complete numeric comparison
 
 We generated the cheat sheet above. Here we dig deeper into what those numbers mean for training.
@@ -1215,6 +1370,8 @@ md(r"""
 - This is why **FP16 needs loss scaling** but **BF16 usually does not**.
 
 ### 1.2.1 TF32 — the hidden precision mode
+
+*(See §1.1.9 above for a detailed TF32 deep dive with code demo.)*
 
 On NVIDIA Ampere+ GPUs, FP32 matmuls can automatically use **TF32** internally:
 - Same 8-bit exponent as FP32 (full range)
@@ -2157,33 +2314,84 @@ print("but stochastic rounding remains relevant for FP8 training and research.")
 md(r"""
 ## 2.11 FP8 for deep learning: why it exists and why it's not just "AMP but smaller"
 
-FP8 is attractive because it can further reduce memory bandwidth and increase tensor-core throughput compared to FP16/BF16.
+FP8 is attractive because it can further reduce memory bandwidth and increase tensor-core throughput compared to FP16/BF16. NVIDIA's H100 (Hopper architecture, 2022) and H200 GPUs include dedicated FP8 Tensor Cores that deliver ~2× the throughput of FP16 Tensor Cores.
 
 But FP8 is fundamentally different from FP16/BF16:
 - the representable grid is *much* coarser
 - range depends strongly on the FP8 variant (commonly summarized as **E4M3** vs **E5M2**)
 - most practical FP8 training systems rely on **explicit scaling** (per-tensor/per-channel) and carefully chosen accumulation dtypes
 
-**The mental model:** FP8 compute works when you pair it with an explicit scale factor that keeps values near the "sweet spot" of the format. This makes FP8 closer to "learned quantization with dynamic scaling" than to the drop-in nature of BF16 autocast.
+### E4M3 vs E5M2: two formats for two jobs
+
+| Property | **E4M3** (float8_e4m3fn) | **E5M2** (float8_e5m2) |
+|---|---|---|
+| Exponent bits | 4 | 5 |
+| Mantissa bits | 3 | 2 |
+| Max finite value | 448 | 57,344 |
+| Smallest normal | ~0.015625 | ~6.1e-5 |
+| Precision (ULP at 1.0) | 0.125 | 0.25 |
+| Primary use case | **Forward pass** (more precision) | **Backward pass** (more range for gradients) |
+
+The key insight: **E4M3 prioritizes precision** (3 mantissa bits give finer resolution for activations and weights in the forward pass), while **E5M2 prioritizes range** (5 exponent bits give wider dynamic range for gradients in the backward pass, which can span many orders of magnitude).
+
+A typical FP8 training recipe uses **E4M3 for forward-pass tensors** and **E5M2 for gradient tensors**.
+
+### Per-tensor scaling: why FP8 is fundamentally different from FP16/BF16 AMP
+
+With FP16/BF16 AMP, autocast just changes the dtype and the hardware handles the rest. With FP8, the representable range is so narrow that you need an **explicit scale factor per tensor** (or per channel/block) to map your values into the format's sweet spot.
+
+This means:
+1. Before casting a tensor to FP8, compute its `amax` (absolute maximum value).
+2. Choose a scale factor $S$ such that $\text{tensor} / S$ fits within the FP8 representable range.
+3. Store and propagate $S$ alongside the FP8 tensor.
+4. Undo the scaling when you need the real values back.
+
+This makes FP8 closer to **learned quantization with dynamic scaling** than to the drop-in nature of BF16 autocast. Current FP8 training typically uses frameworks like NVIDIA's Transformer Engine or specialized `torch.float8` APIs that manage this scaling metadata automatically.
 
 **How it maps to AMP/autocast:**
-- AMP is primarily about FP16/BF16 (and TF32) policies inside a framework like PyTorch.
-- FP8 usually requires a specialized kernel stack (often beyond the default `torch.amp.autocast`) that manages scaling metadata alongside tensors.
+- AMP (`torch.amp.autocast`) is primarily about FP16/BF16 (and TF32) policies.
+- FP8 usually requires a specialized kernel stack (often beyond the default autocast) that manages scaling metadata alongside tensors.
+- Libraries like NVIDIA Transformer Engine integrate FP8 into the training loop with per-tensor delayed scaling (using amax history from previous iterations).
 """)
 
 
 md(r"""
 ## 2.12 8-bit optimizer-state work: the next bottleneck after AMP
 
-Classic AMP reduces activation memory and speeds up matmuls, but for large models the **optimizer state** becomes a dominant fixed cost (ZeRO's 16 bytes/parameter for Adam mixed precision).
+Classic AMP reduces activation memory and speeds up matmuls, but for large models the **optimizer state** becomes a dominant fixed cost (ZeRO's 16 bytes/parameter for Adam mixed precision — 8 of those bytes are just the two FP32 moment buffers).
 
 This motivates a separate line of work: compressing the **optimizer state** (and sometimes gradients) to 8-bit representations while preserving training quality.
 
+### Dettmers et al. (2022): Block-wise Quantization
+
+The key technique from *8-bit Optimizers via Block-wise Quantization*:
+
+1. **Block-wise quantization:** Split each optimizer state tensor (e.g., Adam's $m$ and $v$) into contiguous blocks of **2048 elements**. Each block gets its own normalization constant (the block's absolute maximum), so outliers in one region don't destroy precision for the rest.
+
+2. **Dynamic tree quantization:** Instead of uniform quantization (which wastes bins on empty ranges), use a **non-uniform mapping** designed for the actual distribution of optimizer states. Optimizer moments tend to follow heavy-tailed distributions, so more bins are allocated near zero and fewer at the extremes. The mapping is computed via a binary tree structure that adapts to the data distribution.
+
+3. **Stable embedding layer:** The embedding layer's optimizer state is particularly sensitive to quantization (sparse updates, high variance). Dettmers et al. propose keeping embedding optimizer states in higher precision or using a stabilized update rule.
+
+**Practical result:** ~75% memory reduction for optimizer state (from 8 bytes/param down to ~2 bytes/param for the moment buffers) with negligible accuracy loss across a wide range of tasks and model sizes.
+
+### Integration with bitsandbytes
+
+The `bitsandbytes` library makes this a near-drop-in replacement:
+
+```python
+import bitsandbytes as bnb
+
+# Drop-in replacement for torch.optim.AdamW
+optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=1e-3)
+```
+
+The optimizer internally quantizes $m$ and $v$ to 8-bit after each update and dequantizes before the next step. The model parameters and gradients remain in their original precision (FP32 or whatever AMP provides).
+
 **How it relates to autocast:**
 - Autocast is about *compute dtype choice per op* during forward/loss (and indirectly backward).
-- 8-bit optimizers are about *storage precision* and *update math* for long-lived optimizer tensors.
+- 8-bit optimizers are about *storage precision* for long-lived optimizer tensors.
 
-They are complementary: you can use AMP for activations/compute and (in some stacks) use 8-bit optimizer states to reduce memory.
+They are complementary: you can use AMP for activations/compute and 8-bit optimizers to reduce the memory footprint of optimizer state. Combined, they can bring the per-parameter memory cost from 16 bytes (standard Adam) down to ~10 bytes (8-bit optimizer + FP32 params/grads).
 """)
 
 
@@ -3056,6 +3264,8 @@ Config D data flow (FP32 params + autocast):
 ```
 
 The promotion at residual connections is a key feature: it prevents precision loss from accumulating through the network's residual stream.
+
+> **Note on BatchNorm (for CNN practitioners):** While our transformer example uses LayerNorm, convolutional architectures typically use **BatchNorm**, which maintains running statistics (`running_mean`, `running_var`) that are updated with an exponential moving average across batches. These running statistics must stay in **FP32** — they are long-lived accumulators that would drift significantly in FP16/BF16. PyTorch's autocast handles this automatically (BatchNorm is on the FP32 "keep" list), but if you manually cast your model with `.half()` or `.bfloat16()`, the running statistics will also be cast to low precision, potentially corrupting them over many batches. If you must manually cast, keep normalization layers in FP32: `model.half(); for m in model.modules(): if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)): m.float()`.
 """)
 
 
@@ -3844,7 +4054,8 @@ def train_one(cfg):
 
     tokens_per_step = cfg.batch_size * cfg.block_size
 
-    for step in range(cfg.steps):
+    pbar = tqdm(range(cfg.steps), desc=cfg.name, leave=False, unit="step")
+    for step in pbar:
         # GPU kernels are async; synchronize so step_time_ms reflects actual compute.
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -3887,6 +4098,9 @@ def train_one(cfg):
         logs["scale"].append(scale_val)
         logs["cuda_mem_mb"].append(torch.cuda.max_memory_allocated() / 1024**2 if device.type == "cuda" else float("nan"))
 
+        # Update progress bar with live metrics
+        pbar.set_postfix(loss=f"{float(loss):.3f}", tok_s=f"{tokens_per_step / dt:.0f}")
+
         if cfg.eval_interval and (step % cfg.eval_interval == 0 or step == cfg.steps - 1):
             try:
                 ev = estimate_loss(
@@ -3902,6 +4116,8 @@ def train_one(cfg):
             except Exception:
                 logs["val_step"].append(step)
                 logs["val_loss"].append(float("nan"))
+
+    pbar.close()
 
     # Save final weights for downstream analysis (e.g., text generation).
     # Store as FP32 on CPU for portability and to avoid holding multiple GPU copies.
@@ -3987,18 +4203,19 @@ def _safe_ppl(loss):
         return float("inf")
 
 results = []
-for cfg in suite:
-    print(f"\n{'='*50}")
-    print(f"Running: {cfg.name}")
-    print(f"{'='*50}")
+suite_pbar = tqdm(suite, desc="Experiment suite", unit="exp")
+for cfg in suite_pbar:
+    suite_pbar.set_description(f"Running: {cfg.name}")
     try:
         res = train_one(cfg)
-        print(f"  Status: {res['status']}, Steps: {len(res['logs']['step'])}")
+        print(f"  {cfg.name}: status={res['status']}, steps={len(res['logs']['step'])}", end="")
         if res['logs']['train_loss']:
-            print(f"  Final train loss: {res['logs']['train_loss'][-1]:.4f}")
+            print(f", final_loss={res['logs']['train_loss'][-1]:.4f}")
+        else:
+            print()
         results.append(res)
     except Exception as e:
-        print(f"  Exception: {type(e).__name__}: {e}")
+        print(f"  {cfg.name}: exception: {type(e).__name__}: {e}")
         results.append({
             "config": cfg,
             "status": f"exception: {type(e).__name__}",
@@ -4318,6 +4535,24 @@ For LLM-scale training, it helps to separate memory into:
 
 AMP/autocast primarily helps with **activation memory** (and speed). With AdamW, the fixed-size **bytes/parameter** are often **~16 bytes/param** in both FP32 and "standard AMP" because optimizer state dominates.
 
+### The key comparison: FP32 vs mixed precision (AdamW)
+
+| Component | FP32 Training | Mixed Precision (AMP) | Savings |
+|---|---|---|---|
+| **Parameters** | 4 B/param (FP32) | 4 B/param (FP32 master) | 0% |
+| **Gradients** | 4 B/param (FP32) | 4 B/param (FP32) | 0% |
+| **Optimizer state** ($m$) | 4 B/param (FP32) | 4 B/param (FP32) | 0% |
+| **Optimizer state** ($v$) | 4 B/param (FP32) | 4 B/param (FP32) | 0% |
+| **Total fixed** | **16 B/param** | **16 B/param** | **0%** |
+| **Activations** (varies) | FP32 | FP16/BF16 (~half) | **~50%** |
+
+**The surprise:** Standard PyTorch AMP does *not* reduce fixed per-parameter memory at all! The savings come entirely from **activations** (which are stored in FP16/BF16 for the backward pass) and from **faster compute** (Tensor Cores). For large-batch, long-sequence training, activation memory dominates, so AMP's 50% activation reduction is substantial.
+
+To reduce fixed per-parameter memory, you need additional techniques:
+- **8-bit optimizers** (§2.12): reduce optimizer state from 8 B/param to ~2 B/param
+- **FP16/BF16 master weights** (e.g., in some FSDP/ZeRO configs): reduce param storage
+- **Gradient compression**: reduce gradient storage during distributed training
+
 We'll compute the fixed-size accounting for a few common patterns and show what that looks like for our TinyGPT.
 """)
 
@@ -4421,6 +4656,59 @@ plt.tight_layout()
 print("\nNote: This shows only fixed-size memory (params + grads + optimizer).")
 print("Activations (which scale with batch×seq_len) are the real memory win for AMP.")
 print("For large models, activation memory often exceeds parameter memory by 5-10x.")
+""")
+
+code(r"""
+# Side-by-side: FP32 vs AMP (with estimated activation memory)
+# Illustrates where AMP memory savings actually come from.
+
+# Assume a representative activation memory estimate:
+# For a transformer, activation memory per token ≈ 2 * n_layers * n_embd * bytes_per_element
+# With batch_size=32, block_size=64 → 2048 tokens
+n_tokens = 32 * 64  # batch_size * block_size
+n_layers_est = 2
+n_embd_est = 128
+
+# Rough activation bytes: each layer stores ~4 intermediate tensors of shape [batch, seq, embd]
+act_tensors_per_layer = 4  # (attention input, attention output, FFN input, FFN output)
+act_elements = n_tokens * n_embd_est * n_layers_est * act_tensors_per_layer
+
+fp32_fixed = n_params * 16  # 16 B/param
+amp_fixed = n_params * 16   # same: 16 B/param
+fp32_act = act_elements * 4  # FP32 activations
+amp_act = act_elements * 2   # FP16/BF16 activations
+
+categories = ["Fixed\n(params+grads+opt)", "Activations\n(saved for backward)", "Total"]
+fp32_vals = np.array([fp32_fixed, fp32_act, fp32_fixed + fp32_act]) / 1024**2
+amp_vals = np.array([amp_fixed, amp_act, amp_fixed + amp_act]) / 1024**2
+
+fig, ax = plt.subplots(figsize=(10, 4))
+x = np.arange(len(categories))
+w = 0.35
+bars1 = ax.bar(x - w/2, fp32_vals, w, label="FP32", color="C0", alpha=0.8, edgecolor="black", linewidth=0.5)
+bars2 = ax.bar(x + w/2, amp_vals, w, label="AMP (FP16/BF16)", color="C1", alpha=0.8, edgecolor="black", linewidth=0.5)
+
+# Annotate bars with values
+for bars in [bars1, bars2]:
+    for bar in bars:
+        h = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2, h + 0.01, f"{h:.2f}",
+                ha="center", va="bottom", fontsize=8)
+
+ax.set_xticks(x)
+ax.set_xticklabels(categories, fontsize=9)
+ax.set_ylabel("Memory (MB)")
+ax.set_title(f"FP32 vs AMP memory breakdown (TinyGPT, {n_params:,} params, batch=32×64)", fontsize=11)
+ax.legend()
+plt.tight_layout()
+
+savings_pct = (1 - (amp_fixed + amp_act) / (fp32_fixed + fp32_act)) * 100
+print(f"Fixed memory: identical (16 B/param in both regimes)")
+print(f"Activation memory: {fp32_act/1024**2:.2f} MB (FP32) → {amp_act/1024**2:.2f} MB (AMP) = 50% reduction")
+print(f"Total estimated savings: {savings_pct:.1f}%")
+print()
+print("At LLM scale (billions of params, long sequences), activation memory dominates,")
+print("so the ~50% activation reduction from AMP translates to substantial GPU memory savings.")
 """)
 
 
