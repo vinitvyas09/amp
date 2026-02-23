@@ -69,6 +69,10 @@ This notebook is organized into **three sections**:
 - What is the "sum vs mean" mystery under autocast?
 - How does the gradient distribution relate to FP16's representable range?
 - How many bytes per parameter does mixed-precision Adam training actually use?
+- Why is floating-point addition NOT associative, and why does that matter for GPU reductions?
+- What is catastrophic cancellation, and why does it make LayerNorm precision-sensitive?
+- How does stochastic rounding differ from deterministic rounding, and when does it help?
+- Which layers in a transformer are most affected by autocast precision changes?
 
 ---
 
@@ -89,6 +93,9 @@ This notebook is organized into **three sections**:
 - FP16 vs BF16 vs FP32 vs TF32 (tables you can trust)
 - The bit-level addition trap (why `1 + 1e-4 = 1` in FP16) — with step-by-step binary alignment
 - Underflow, overflow, accumulation error
+- **Non-associativity**: why summation order matters in low precision
+- **Catastrophic cancellation**: why LayerNorm/BatchNorm need FP32
+- **Kahan summation**: the compensated-sum fix
 - What AMP is (autocast + grad scaling)
 - Master weights, optimizer state, and accumulation
 
@@ -98,6 +105,7 @@ This notebook is organized into **three sections**:
 - NVIDIA mixed precision guidance
 - BF16 design intent
 - PyTorch AMP operator policy
+- **Stochastic rounding**: why it helps low-precision training (Gupta et al.)
 - Rajbhandari et al. — ZeRO and optimizer state precision
 - LLM training stacks (FSDP/ZeRO) and where AMP fits
 - FP8 and 8-bit optimizers
@@ -107,6 +115,7 @@ This notebook is organized into **three sections**:
 - Build an operator policy table *from your local PyTorch*
 - The "sum vs mean" mystery
 - Visualize dtype flow through a transformer (4 configurations)
+- **Per-layer precision sensitivity**: which parts of the transformer hurt most?
 - Gradient underflow + the effect of loss scaling
 - **Micikevicius-style gradient histogram analysis**
 - Weight update stagnation
@@ -1448,11 +1457,11 @@ code(r"""
 # Catastrophic cancellation in variance computation
 
 def variance_naive(x):
-    """Var(X) = E[X^2] - E[X]^2 -- catastrophic cancellation when E[X] >> std(X)"""
+    # Var(X) = E[X^2] - E[X]^2 -- catastrophic cancellation when E[X] >> std(X)
     return (x ** 2).mean() - x.mean() ** 2
 
 def variance_safe(x):
-    """Var(X) = E[(X - E[X])^2] -- avoids large-number subtraction"""
+    # Var(X) = E[(X - E[X])^2] -- avoids large-number subtraction
     return ((x - x.mean()) ** 2).mean()
 
 # Test with offset data: mean ≈ 10000, std ≈ 0.1
@@ -1517,7 +1526,7 @@ code(r"""
 # Kahan summation vs naive summation in low precision
 
 def kahan_sum(values, dtype):
-    """Compensated summation in the given dtype."""
+    # Compensated summation in the given dtype.
     s = torch.tensor(0.0, dtype=dtype)
     c = torch.tensor(0.0, dtype=dtype)   # compensation for lost low-order bits
     for v in values:
@@ -1528,7 +1537,7 @@ def kahan_sum(values, dtype):
     return float(s)
 
 def naive_sum(values, dtype):
-    """Simple sequential sum in the given dtype."""
+    # Simple sequential sum in the given dtype.
     s = torch.tensor(0.0, dtype=dtype)
     for v in values:
         s = s + v.to(dtype)
@@ -2045,7 +2054,7 @@ code(r"""
 # Stochastic rounding demo: accumulate tiny updates in FP16
 
 def stochastic_round_fp16(x_fp32):
-    """Round FP32 value to FP16 with stochastic rounding."""
+    # Round FP32 value to FP16 with stochastic rounding.
     x_lo = torch.tensor(float(x_fp32), dtype=torch.float16).float()
     x_hi = torch.nextafter(torch.tensor(float(x_fp32), dtype=torch.float16),
                            torch.tensor(float("inf"), dtype=torch.float16)).float()
