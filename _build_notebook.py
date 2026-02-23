@@ -35,6 +35,8 @@ md(r"""
 
 Every neural network is fundamentally a giant mathematical expression, and training is the process of tuning the constants (weights) so that expression approximates reality. We do this by computing a loss, backpropagating to get gradients, and nudging the weights a tiny bit in the right direction. Repeat billions of times.
 
+Why do we care about this *now*? Because modern deep learning training is GPU-dominated and compute-hungry. Matrix multiplications are embarrassingly parallel, so GPUs can run thousands of tiny operations at once — but as models grow, the cost of training keeps rising. Mixed precision training is one of the highest-leverage efficiency techniques we have: it uses fast low-precision hardware (Tensor Cores / specialized units) where it's safe, while preserving FP32 where training would otherwise become numerically unstable.
+
 But here's the thing: those weights and gradients are stored as **floating-point numbers**. And floating-point numbers are *not* real numbers. They are a finite approximation with a specific *resolution*. That resolution depends on the format — FP32, FP16, BF16, TF32, FP8 — and each format makes a different tradeoff between **range** (how large and small the numbers can get) and **precision** (how fine the steps between consecutive representable values are).
 
 This matters because during training, we routinely deal with numbers spanning many orders of magnitude: weights around $10^0$, gradients as small as $10^{-8}$, attention logits that can spike to $10^3$, and accumulations over thousands of values. A format that can't represent tiny gradients kills learning (they become zero). A format that can't represent large attention logits kills stability (they become infinity). A format that rounds too aggressively corrupts the running statistics that normalization layers depend on.
@@ -81,6 +83,12 @@ This notebook is organized into **three sections**:
 - Read the markdown, then run the code cells.
 - Most experiments are designed to run in a few minutes on a single GPU.
 - CPU-only runs are supported for the *conceptual* demos, but some mixed-precision behaviors (and speedups) are fundamentally GPU-driven.
+
+### If you're in a hurry (recommended run path)
+
+- **10 minutes:** run setup → Quick Reference table → **3.1 progressive mixed precision** plots
+- **30–60 minutes (GPU):** add **3.6 TinyGPT training suite** (loss/time/memory graphs)
+- **Deep dive:** run everything in order; each experiment builds on the previous mental model
 
 ---
 
@@ -1241,15 +1249,33 @@ b = torch.randn(M, M, device=device, dtype=torch.float32)
 
 ref = (a.double() @ b.double()).float()
 
+def _err_stats(c, ref):
+    c = c.float()
+    abs_err = (c - ref).abs()
+    rel_err = abs_err / (ref.abs() + 1e-6)
+    return abs_err, rel_err
+
 rows = []
-for dt in [torch.float16, torch.bfloat16, torch.float32]:
+for dt in [torch.float16, torch.bfloat16]:
     if not supports_dtype_on_device(dt, device):
         continue
     try:
         c_dt = a.to(dt) @ b.to(dt)
+        abs_err, rel_err = _err_stats(c_dt, ref)
+        rows.append({
+            "dtype": str(dt).replace("torch.", ""),
+            "matmul_mode": "native",
+            "matmul_output_dtype": str(c_dt.dtype).replace("torch.", ""),
+            "max_abs_err": f"{float(abs_err.max()):.2e}",
+            "mean_abs_err": f"{float(abs_err.mean()):.2e}",
+            "max_rel_err": f"{float(rel_err.max()):.2e}",
+            "mean_rel_err": f"{float(rel_err.mean()):.2e}",
+            "note": "",
+        })
     except Exception as e:
         rows.append({
             "dtype": str(dt).replace("torch.", ""),
+            "matmul_mode": "native",
             "matmul_output_dtype": "-",
             "max_abs_err": "-",
             "mean_abs_err": "-",
@@ -1257,24 +1283,47 @@ for dt in [torch.float16, torch.bfloat16, torch.float32]:
             "mean_rel_err": "-",
             "note": f"matmul failed ({type(e).__name__})",
         })
-        continue
-    c = c_dt.float()
-    abs_err = (c - ref).abs()
-    rel_err = abs_err / (ref.abs() + 1e-6)
-    rows.append({
-        "dtype": str(dt).replace("torch.", ""),
-        "matmul_output_dtype": str(c_dt.dtype).replace("torch.", ""),
-        "max_abs_err": f"{float(abs_err.max()):.2e}",
-        "mean_abs_err": f"{float(abs_err.mean()):.2e}",
-        "max_rel_err": f"{float(rel_err.max()):.2e}",
-        "mean_rel_err": f"{float(rel_err.mean()):.2e}",
-        "note": "",
-    })
+
+# FP32: on CUDA this may be strict FP32 or TF32 depending on allow_tf32.
+if supports_dtype_on_device(torch.float32, device):
+    if device.type == "cuda":
+        orig_tf32 = torch.backends.cuda.matmul.allow_tf32
+        try:
+            for allow in [False, True]:
+                torch.backends.cuda.matmul.allow_tf32 = allow
+                c = a @ b
+                abs_err, rel_err = _err_stats(c, ref)
+                rows.append({
+                    "dtype": "float32",
+                    "matmul_mode": "strict_fp32" if not allow else "tf32_allowed",
+                    "matmul_output_dtype": str(c.dtype).replace("torch.", ""),
+                    "max_abs_err": f"{float(abs_err.max()):.2e}",
+                    "mean_abs_err": f"{float(abs_err.mean()):.2e}",
+                    "max_rel_err": f"{float(rel_err.max()):.2e}",
+                    "mean_rel_err": f"{float(rel_err.mean()):.2e}",
+                    "note": "",
+                })
+        finally:
+            torch.backends.cuda.matmul.allow_tf32 = orig_tf32
+    else:
+        c = a @ b
+        abs_err, rel_err = _err_stats(c, ref)
+        rows.append({
+            "dtype": "float32",
+            "matmul_mode": "native",
+            "matmul_output_dtype": str(c.dtype).replace("torch.", ""),
+            "max_abs_err": f"{float(abs_err.max()):.2e}",
+            "mean_abs_err": f"{float(abs_err.mean()):.2e}",
+            "max_rel_err": f"{float(rel_err.max()):.2e}",
+            "mean_rel_err": f"{float(rel_err.mean()):.2e}",
+            "note": "",
+        })
 
 display(pd.DataFrame(rows))
 print("\nNotes:")
 print("- Errors come from (1) input rounding to dt and (2) output rounding back to dt.")
 print("- On CUDA, FP16/BF16 matmuls usually accumulate in FP32 internally, which helps stability.")
+print("- On Ampere+ CUDA GPUs, float32 matmuls may run in TF32 mode when allow_tf32=True (10 mantissa bits).")
 """)
 
 
@@ -3503,36 +3552,51 @@ Before the full training suite, we'll also do:
 code(r"""
 # Tiny corpus + character-level tokenizer
 
-corpus_lines = [
-    "Autocast is not a global cast. It is an operator policy that routes each operation to the right precision.",
-    "Some ops run in lower precision for speed. Matmuls and linear layers are the primary targets.",
-    "Some ops run in float32 for stability. Softmax, layer normalization, and cross entropy need full precision.",
-    "Loss scaling rescues fp16 gradients from underflow by multiplying the loss before backward.",
-    "Bfloat16 has the same exponent range as float32, which means gradients rarely underflow to zero.",
-    "Transformers amplify numeric issues because attention involves softmax over large logits.",
-    "Master weights in fp32 prevent update stagnation where small gradients get rounded away.",
-    "Optimizer state like Adam moments should be kept in fp32 for long-horizon accumulation stability.",
-    "The fundamental tradeoff in floating point is range versus precision and they cannot both be maximized.",
-    "FP16 has ten mantissa bits and five exponent bits giving it better precision but much narrower range.",
-    "BF16 has seven mantissa bits and eight exponent bits giving it the same range as FP32 but coarser precision.",
-    "Modern GPUs have tensor cores that execute sixteen bit matrix multiplications with fp32 accumulation.",
-    "A single training step involves forward pass, loss computation, backward pass, and optimizer update.",
-    "Gradient accumulation with mixed precision requires careful ordering of scale, backward, unscale, and step.",
-    "Dynamic loss scaling starts with a large scale factor and halves it whenever overflow is detected.",
-    "When the gradient scaler detects infinity or NaN values it skips the optimizer step entirely.",
-    "The ZeRO optimizer partitions parameters gradients and optimizer state across multiple GPUs.",
-    "Mixed precision training saves memory primarily through reduced activation storage not parameter storage.",
-    "For a model with one billion parameters Adam mixed precision training requires about sixteen gigabytes.",
-    "TF32 is not a storage format but an internal compute mode used by tensor cores on Ampere GPUs.",
-    "Epsilon is the smallest number that when added to one produces a result strictly greater than one.",
-    "Neural networks are robust to gradient noise because stochastic gradient descent is inherently noisy.",
-    "The residual connection in transformers promotes dtype from sixteen bit back to thirty two bit under autocast.",
-    "FP8 training requires explicit per tensor scaling because the representable range is extremely narrow.",
-    "Weight stagnation happens when the learning rate times gradient product is below the unit in last place.",
+from pathlib import Path
+import re
+
+# Use the repo's reference material as training text (no external downloads).
+# Falls back to a small built-in corpus if the files aren't present.
+FALLBACK_LINES = [
+    "Autocast is not a global cast: it is an operator policy that routes each operation to the right precision.",
+    "Matmuls/linears are the primary AMP targets because they map cleanly to Tensor Cores with FP32 accumulation.",
+    "Softmax, layer normalization, exp/log, and many reductions are numerically sensitive and often run in FP32.",
+    "FP16 has narrow exponent range → gradient underflow; BF16 keeps FP32 exponent range → underflow is rare.",
+    "GradScaler implements dynamic loss scaling: scale loss → backward → unscale grads → step → update scale.",
 ]
 
-corpus = "\n".join(corpus_lines).strip()
-corpus = corpus * 30  # repeat for more training data
+def _read_text(path: str) -> str | None:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except Exception:
+        return None
+
+sources_used = []
+parts = []
+for p in ["sources/source4.md", "sources/source5.md"]:
+    t = _read_text(p)
+    if t:
+        parts.append(t)
+        sources_used.append(p)
+
+raw = "\n".join(FALLBACK_LINES).strip()
+if parts:
+    raw = raw + "\n\n" + "\n\n".join(parts)
+
+# Minimal cleanup: remove code fences (if any) and normalize whitespace.
+raw = raw.replace("\r\n", "\n")
+raw = re.sub(r"```.*?```", "", raw, flags=re.S)
+raw = re.sub(r"[ \t]+", " ", raw)
+raw = re.sub(r"\n{3,}", "\n\n", raw)
+corpus = raw.strip()
+
+# Keep runtime predictable: cap corpus size and repeat if too small.
+TARGET_CHARS = 120_000
+if len(corpus) < TARGET_CHARS:
+    repeats = (TARGET_CHARS // max(len(corpus), 1)) + 1
+    corpus = ((corpus + "\n") * repeats)[:TARGET_CHARS]
+else:
+    corpus = corpus[:TARGET_CHARS]
 
 chars = sorted(set(corpus))
 stoi = {ch: i for i, ch in enumerate(chars)}
@@ -3545,12 +3609,13 @@ def encode(s):
 def decode_tokens(ids):
     return "".join(itos[i] for i in ids)
 
-data = torch.tensor(encode(corpus), dtype=torch.long)
+data = torch.tensor(encode(corpus), dtype=torch.long).to(device)
 n = int(0.9 * len(data))
 train_data, val_data = data[:n], data[n:]
 
 print(f"Vocab size: {vocab_size}")
 print(f"Train tokens: {len(train_data):,}, Val tokens: {len(val_data):,}")
+print(f"Corpus sources used: {sources_used if sources_used else ['fallback_only']}")
 print(f"Sample: {decode_tokens(train_data[:80].tolist())}")
 """)
 
@@ -3558,10 +3623,13 @@ code(r"""
 # Batch sampling + evaluation
 
 def get_batch(split, batch_size, block_size):
+    # Vectorized slicing (no Python loops) and stays on `device`.
     src = train_data if split == "train" else val_data
-    ix = torch.randint(len(src) - block_size - 1, (batch_size,))
-    x = torch.stack([src[i:i+block_size] for i in ix]).to(device)
-    y = torch.stack([src[i+1:i+block_size+1] for i in ix]).to(device)
+    max_start = src.size(0) - block_size - 1
+    ix = torch.randint(0, max_start, (batch_size,), device=src.device)
+    offsets = torch.arange(block_size, device=src.device).unsqueeze(0)
+    x = src[ix.unsqueeze(1) + offsets]
+    y = src[ix.unsqueeze(1) + offsets + 1]
     return x, y
 
 @torch.no_grad()
@@ -3574,7 +3642,7 @@ def estimate_loss(model, block_size, batch_size, iters=20, use_autocast=False, a
             x, y = get_batch(split, batch_size, block_size)
             with amp_autocast(device, amp_dtype, enabled=use_autocast):
                 logits = model(x)
-                loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+                loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
             losses.append(float(loss))
         out[split] = float(np.mean(losses))
     model.train()
@@ -3619,7 +3687,7 @@ def loss_and_grads(model, x, y, use_autocast=False, amp_dtype=None):
         p.grad = None
     with amp_autocast(device, amp_dtype, enabled=use_autocast):
         logits = model(x)
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
     loss.backward()
     grads = {n: p.grad.detach().float().cpu().clone() for n, p in model.named_parameters() if p.grad is not None}
     return float(loss.detach().cpu()), grads
