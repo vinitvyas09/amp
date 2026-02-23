@@ -1383,6 +1383,185 @@ display(pd.DataFrame(rows))
 print("\nThis is a simplified version of why LayerNorm/Softmax reductions are often forced to FP32 under autocast.")
 """)
 
+
+md(r"""
+### 1.3.0a Why floating-point addition is NOT associative
+
+In real-number math, addition is **associative**: $(a + b) + c = a + (b + c)$. In floating-point, this identity breaks because **rounding happens after every operation**.
+
+This has a direct practical consequence: **the order in which you sum values affects the result**. When autocast forces reductions to FP32, one reason is this: the same sum computed in FP16 vs FP32 gives different answers because rounding error accumulates differently with fewer mantissa bits.
+
+This also means **nondeterministic reduction order** (common in parallel GPU kernels) can cause run-to-run variance in low precision. Knowing this helps debug "my loss is slightly different every run" issues.
+""")
+
+code(r"""
+# Non-associativity of floating-point addition
+
+# Choose three values where grouping matters
+a_val, b_val, c_val = 1.0, 1e-4, -1.0
+
+rows = []
+for dt in [torch.float16, torch.bfloat16, torch.float32, torch.float64]:
+    a = torch.tensor(a_val, dtype=dt)
+    b = torch.tensor(b_val, dtype=dt)
+    c = torch.tensor(c_val, dtype=dt)
+
+    lhs = (a + b) + c      # (1 + 1e-4) + (-1)
+    rhs = a + (b + c)       # 1 + (1e-4 + (-1))
+
+    rows.append({
+        "dtype": str(dt).replace("torch.", ""),
+        "(a+b)+c": f"{float(lhs):.8e}",
+        "a+(b+c)": f"{float(rhs):.8e}",
+        "equal?": "YES" if float(lhs) == float(rhs) else "NO",
+        "abs_diff": f"{abs(float(lhs) - float(rhs)):.2e}",
+        "explanation": "",
+    })
+
+display(pd.DataFrame(rows))
+
+print("\nWhat happened:")
+print("  (a+b)+c: first computes 1.0 + 1e-4. In FP16, this is just 1.0 (addition trap).")
+print("           Then 1.0 + (-1.0) = 0.0. The 1e-4 is completely lost.")
+print("  a+(b+c): first computes 1e-4 + (-1.0) = -0.9999. No precision loss here.")
+print("           Then 1.0 + (-0.9999) = 1e-4 (approximately). The value survives!")
+print()
+print("Practical lesson: summation order matters in low precision.")
+print("This is one reason parallel GPU reductions can give different results than sequential ones,")
+print("and why autocast promotes large reductions to FP32 where the effect is negligible.")
+""")
+
+
+md(r"""
+### 1.3.0b Catastrophic cancellation: when subtraction destroys information
+
+**Catastrophic cancellation** occurs when you subtract two nearly-equal numbers. The leading significant digits cancel, leaving only the noisy trailing digits. In low precision, there are fewer trailing digits to begin with, so the result can be almost entirely noise.
+
+This is exactly what happens in **variance computation**: $\text{Var}(X) = E[X^2] - (E[X])^2$. If the mean is large relative to the standard deviation, both $E[X^2]$ and $(E[X])^2$ are large and nearly equal. The subtraction amplifies the rounding error in each term.
+
+This is the mechanical reason **LayerNorm and BatchNorm statistics need FP32** under autocast.
+
+The "safe" formula avoids the cancellation: $\text{Var}(X) = E[(X - E[X])^2]$ -- subtract the mean *before* squaring, so you never form two large nearly-equal numbers.
+""")
+
+code(r"""
+# Catastrophic cancellation in variance computation
+
+def variance_naive(x):
+    """Var(X) = E[X^2] - E[X]^2 -- catastrophic cancellation when E[X] >> std(X)"""
+    return (x ** 2).mean() - x.mean() ** 2
+
+def variance_safe(x):
+    """Var(X) = E[(X - E[X])^2] -- avoids large-number subtraction"""
+    return ((x - x.mean()) ** 2).mean()
+
+# Test with offset data: mean ≈ 10000, std ≈ 0.1
+set_seed(0)
+x_fp32 = (torch.randn(50_000, device=device) * 0.1 + 10_000.0).float()
+ref_var = float(variance_safe(x_fp32.double()))
+
+rows = []
+for dt in [torch.float16, torch.bfloat16, torch.float32]:
+    if not supports_dtype_on_device(dt, device):
+        continue
+    x = x_fp32.to(dt)
+    v_naive = float(variance_naive(x))
+    v_safe = float(variance_safe(x))
+    rows.append({
+        "dtype": str(dt).replace("torch.", ""),
+        "naive_var (E[X²]-E[X]²)": f"{v_naive:.6e}",
+        "safe_var (E[(X-μ)²])": f"{v_safe:.6e}",
+        "reference (FP64)": f"{ref_var:.6e}",
+        "naive_rel_err": f"{abs(v_naive - ref_var) / (ref_var + 1e-30):.2e}",
+        "safe_rel_err": f"{abs(v_safe - ref_var) / (ref_var + 1e-30):.2e}",
+    })
+
+display(pd.DataFrame(rows))
+
+print("\nKey insight:")
+print("  The naive formula (E[X²] - E[X]²) catastrophically cancels in FP16/BF16 because")
+print("  E[X²] ≈ 1e8 and E[X]² ≈ 1e8, but their difference is only ~0.01.")
+print("  Subtracting two huge nearly-equal numbers amplifies the rounding error.")
+print()
+print("  The safe formula (E[(X-μ)²]) subtracts the mean FIRST, so the squared values")
+print("  are small (~0.01) and there's no cancellation.")
+print()
+print("  PyTorch's LayerNorm/BatchNorm use the safe formula internally — but even so,")
+print("  autocast runs them in FP32 because the intermediate accumulations still benefit")
+print("  from higher precision.")
+""")
+
+
+md(r"""
+### 1.3.0c Kahan summation: the compensated-sum fix
+
+If naive accumulation loses precision, can we do better without just using FP32?
+
+**Kahan summation** (compensated summation) tracks a separate "error compensation" variable that captures the rounding error from each addition and feeds it back into the next step. It's like an accountant who keeps a running tally of all the pennies that got rounded off.
+
+```
+running_sum = 0.0
+compensation = 0.0        # tracks accumulated rounding error
+
+for x in values:
+    y = x - compensation   # add back what was lost last time
+    t = running_sum + y    # this addition might round
+    compensation = (t - running_sum) - y   # what got lost this time
+    running_sum = t
+```
+
+Some high-performance kernels internally use compensated summation when operating in low precision. Understanding it helps you appreciate what "accumulate in FP32" really means: it's the brute-force version of the same idea (just use more bits instead of being clever about rounding).
+""")
+
+code(r"""
+# Kahan summation vs naive summation in low precision
+
+def kahan_sum(values, dtype):
+    """Compensated summation in the given dtype."""
+    s = torch.tensor(0.0, dtype=dtype)
+    c = torch.tensor(0.0, dtype=dtype)   # compensation for lost low-order bits
+    for v in values:
+        y = v.to(dtype) - c
+        t = s + y
+        c = (t - s) - y     # captures the rounding error
+        s = t
+    return float(s)
+
+def naive_sum(values, dtype):
+    """Simple sequential sum in the given dtype."""
+    s = torch.tensor(0.0, dtype=dtype)
+    for v in values:
+        s = s + v.to(dtype)
+    return float(s)
+
+# Sum 10,000 small values: 1e-3 each → expected total = 10.0
+N = 10_000
+values = [torch.tensor(1e-3)] * N
+expected = 10.0
+
+rows = []
+for dt in [torch.float16, torch.bfloat16, torch.float32]:
+    n_sum = naive_sum(values, dt)
+    k_sum = kahan_sum(values, dt)
+    rows.append({
+        "dtype": str(dt).replace("torch.", ""),
+        "naive_sum": f"{n_sum:.6f}",
+        "kahan_sum": f"{k_sum:.6f}",
+        "expected": f"{expected:.6f}",
+        "naive_err": f"{abs(n_sum - expected):.4e}",
+        "kahan_err": f"{abs(k_sum - expected):.4e}",
+    })
+
+display(pd.DataFrame(rows))
+
+print("\nKahan summation recovers much of the precision lost by naive accumulation.")
+print("In practice, 'accumulate in FP32' (what Tensor Cores and autocast do) achieves")
+print("the same goal with less complexity: you just use a wider accumulator register.")
+print("But Kahan summation shows that the problem IS solvable in low precision —")
+print("it's just not worth the extra operations when FP32 accumulators are available.")
+""")
+
+
 code(r"""
 # Where does exp() overflow by dtype?
 
@@ -1842,6 +2021,78 @@ Key takeaways often cited from this family of results:
 - Autocast is a modern, practical version of "do low precision where it's safe".
 - Loss scaling is a specialized scaling strategy focused on preserving *gradient* signal in FP16.
 - The accumulation demos in Section 1 (tiny increments and LayerNorm stats) are the same failure modes this literature is trying to avoid.
+""")
+
+
+md(r"""
+### 2.10.1 Stochastic rounding: why it helps low-precision training
+
+One key insight from the Gupta line of work is that **rounding mode matters**.
+
+Standard IEEE 754 rounding is **deterministic** (round-to-nearest, ties-to-even). This creates a systematic problem: if a value consistently falls just below a representable grid point, it *always* rounds down. Over many training steps, this introduces a persistent bias — the value drifts away from where it "should" be.
+
+**Stochastic rounding** instead rounds probabilistically:
+- If a value $x$ falls between grid points $x_\text{lo}$ and $x_\text{hi}$:
+  - Round to $x_\text{hi}$ with probability $(x - x_\text{lo}) / (x_\text{hi} - x_\text{lo})$
+  - Round to $x_\text{lo}$ otherwise
+
+The expected value of the rounded result is $x$ itself — it's an **unbiased** estimator. Over many steps, small updates that would be systematically rounded away under deterministic rounding instead *accumulate on average*.
+
+**Connection to AMP:** Modern autocast doesn't use stochastic rounding (it uses standard IEEE rounding). Instead, it achieves a similar effect by keeping accumulations and updates in FP32, where the deterministic rounding error is small enough not to matter. But in FP8 and other extreme low-precision formats, stochastic rounding is actively used in some training frameworks.
+""")
+
+code(r"""
+# Stochastic rounding demo: accumulate tiny updates in FP16
+
+def stochastic_round_fp16(x_fp32):
+    """Round FP32 value to FP16 with stochastic rounding."""
+    x_lo = torch.tensor(float(x_fp32), dtype=torch.float16).float()
+    x_hi = torch.nextafter(torch.tensor(float(x_fp32), dtype=torch.float16),
+                           torch.tensor(float("inf"), dtype=torch.float16)).float()
+    if float(x_hi) == float(x_lo):
+        return torch.tensor(float(x_lo), dtype=torch.float16)
+    # Probability of rounding up
+    p_up = (x_fp32 - x_lo) / (x_hi - x_lo + 1e-30)
+    p_up = float(p_up.clamp(0, 1))
+    if random.random() < p_up:
+        return torch.tensor(float(x_hi), dtype=torch.float16)
+    else:
+        return torch.tensor(float(x_lo), dtype=torch.float16)
+
+# Accumulate 1.0 + delta * N with delta below FP16 epsilon
+delta = 1e-4
+N = 5000
+expected = 1.0 + delta * N  # 1.5
+
+# Deterministic rounding (standard)
+w_det = torch.tensor(1.0, dtype=torch.float16)
+for _ in range(N):
+    w_det = (w_det.float() + delta).half()  # deterministic round
+
+# Stochastic rounding
+set_seed(42)
+w_stoch = torch.tensor(1.0, dtype=torch.float16)
+for _ in range(N):
+    w_stoch = stochastic_round_fp16(w_stoch.float() + delta)
+
+# FP32 reference
+w_fp32 = torch.tensor(1.0, dtype=torch.float32)
+for _ in range(N):
+    w_fp32 = w_fp32 + delta
+
+print(f"Accumulating {N} updates of delta={delta} starting from 1.0")
+print(f"Expected result: {expected}")
+print(f"  FP16 deterministic: {float(w_det):.6f}  (error: {abs(float(w_det) - expected):.4e})")
+print(f"  FP16 stochastic:    {float(w_stoch):.6f}  (error: {abs(float(w_stoch) - expected):.4e})")
+print(f"  FP32 deterministic: {float(w_fp32):.6f}  (error: {abs(float(w_fp32) - expected):.4e})")
+print()
+print("With deterministic rounding, the delta is below FP16's ULP at 1.0 (~1e-3),")
+print("so it gets rounded away EVERY time. The weight never moves.")
+print("With stochastic rounding, each update has a small probability of 'counting',")
+print("so the weight drifts toward the correct value over many steps.")
+print()
+print("Modern AMP avoids this issue by doing updates in FP32 (where delta > ULP),")
+print("but stochastic rounding remains relevant for FP8 training and research.")
 """)
 
 
@@ -2747,6 +2998,141 @@ Config D data flow (FP32 params + autocast):
 ```
 
 The promotion at residual connections is a key feature: it prevents precision loss from accumulating through the network's residual stream.
+""")
+
+
+md(r"""
+### 3.3.2 Per-layer precision sensitivity: which parts of the transformer hurt most?
+
+The dtype hooks above show *what* dtype each layer uses. But a deeper question is: **which layers are most affected by the precision change?**
+
+We'll feed the same input through our TinyGPT in FP32 vs under autocast, and measure the per-module output error. This tells you which operations are precision-sensitive and why the autocast policy protects certain ops.
+""")
+
+code(r"""
+# Per-layer output error: FP32 vs autocast
+
+import copy
+
+set_seed(0)
+sens_model = TinyGPT(VOCAB, BLOCK, n_layer=2, n_embd=128, n_heads=4, dropout=0.0).to(device).float()
+
+# Collect per-module outputs under FP32 and autocast
+def collect_outputs(model, idx, use_autocast_flag, amp_dt):
+    outputs = {}
+    hooks = []
+    def make_hook(name):
+        def hook(m, inp, out):
+            if isinstance(out, torch.Tensor):
+                outputs[name] = out.detach().float().cpu().clone()
+            elif isinstance(out, (tuple, list)) and len(out) > 0 and isinstance(out[0], torch.Tensor):
+                outputs[name] = out[0].detach().float().cpu().clone()
+        return hook
+
+    for name, m in model.named_modules():
+        if name:  # skip root
+            hooks.append(m.register_forward_hook(make_hook(name)))
+
+    with torch.inference_mode():
+        ctx = amp_autocast(device, amp_dt, enabled=use_autocast_flag)
+        with ctx:
+            _ = model(idx)
+
+    for h in hooks:
+        h.remove()
+    return outputs
+
+idx_sens = torch.randint(0, VOCAB, (2, BLOCK), device=device)
+
+out_fp32 = collect_outputs(sens_model, idx_sens, False, None)
+
+dtype_16 = torch.bfloat16
+if device.type == "cuda" and not torch.cuda.is_bf16_supported():
+    dtype_16 = torch.float16
+elif device.type == "mps":
+    dtype_16 = torch.float16
+
+out_ac = collect_outputs(sens_model, idx_sens, True, dtype_16)
+
+# Compare
+rows = []
+for name in sorted(out_fp32.keys()):
+    if name not in out_ac:
+        continue
+    o32 = out_fp32[name]
+    oac = out_ac[name]
+    if o32.shape != oac.shape:
+        continue
+    abs_err = (oac - o32).abs()
+    rel_err = abs_err / (o32.abs() + 1e-8)
+    rows.append({
+        "module": name,
+        "max_abs_err": f"{float(abs_err.max()):.2e}",
+        "mean_abs_err": f"{float(abs_err.mean()):.2e}",
+        "mean_rel_err": f"{float(rel_err.mean()):.2e}",
+        "max_rel_err": f"{float(rel_err.max()):.2e}",
+    })
+
+df_sens = pd.DataFrame(rows)
+
+# Sort by mean_rel_err descending to show most sensitive layers first
+df_sens["_sort"] = df_sens["mean_rel_err"].apply(lambda x: float(x))
+df_sens = df_sens.sort_values("_sort", ascending=False).drop(columns=["_sort"])
+
+print(f"Per-module output error: FP32 vs autocast({dtype_16})")
+print(f"{'='*70}")
+display(df_sens)
+
+print("\nInterpretation:")
+print("  - Layers with HIGHER error are more precision-sensitive.")
+print("  - LayerNorm, softmax, and final head outputs tend to show larger errors")
+print("    because they involve reductions and normalization.")
+print("  - Linear layers often show small errors because Tensor Cores accumulate in FP32.")
+print("  - This explains why autocast's policy protects normalization and loss ops in FP32.")
+""")
+
+code(r"""
+# Visualize per-layer sensitivity as a bar chart
+
+if len(rows) > 0:
+    fig, ax = plt.subplots(figsize=(14, max(4, len(rows) * 0.3)))
+
+    names_plot = df_sens["module"].tolist()
+    errors_plot = [float(x) for x in df_sens["mean_rel_err"].tolist()]
+
+    # Color by module type
+    colors_plot = []
+    for n in names_plot:
+        if "ln" in n.lower() or "norm" in n.lower():
+            colors_plot.append("#e74c3c")  # red for normalization
+        elif "attn" in n.lower() or "qkv" in n.lower() or "proj" in n.lower():
+            colors_plot.append("#3498db")  # blue for attention
+        elif "mlp" in n.lower() or "fc" in n.lower():
+            colors_plot.append("#2ecc71")  # green for MLP
+        elif "head" in n.lower():
+            colors_plot.append("#9b59b6")  # purple for output head
+        else:
+            colors_plot.append("#95a5a6")  # gray for other
+
+    y_pos = range(len(names_plot))
+    ax.barh(y_pos, errors_plot, color=colors_plot, alpha=0.8, edgecolor="white")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(names_plot, fontsize=7)
+    ax.set_xlabel("Mean relative error (autocast vs FP32)")
+    ax.set_title("Per-layer precision sensitivity: which modules are most affected by autocast?", fontsize=11)
+    ax.set_xscale("log")
+    ax.invert_yaxis()
+
+    from matplotlib.patches import Patch
+    legend_el = [
+        Patch(color="#e74c3c", label="Normalization (most sensitive)"),
+        Patch(color="#3498db", label="Attention"),
+        Patch(color="#2ecc71", label="MLP/Linear"),
+        Patch(color="#9b59b6", label="Output head"),
+        Patch(color="#95a5a6", label="Other"),
+    ]
+    ax.legend(handles=legend_el, loc="lower right", fontsize=8)
+    plt.tight_layout()
 """)
 
 
