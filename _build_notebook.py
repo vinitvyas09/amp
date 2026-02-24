@@ -39,7 +39,7 @@ Why do we care about this *now*? Because modern deep learning training is GPU-do
 
 But here's the thing: those weights and gradients are stored as **floating-point numbers**. And floating-point numbers are *not* real numbers. They are a finite approximation with a specific *resolution*. That resolution depends on the format — FP32, FP16, BF16, TF32, FP8 — and each format makes a different tradeoff between **range** (how large and small the numbers can get) and **precision** (how fine the steps between consecutive representable values are).
 
-This matters because during training, we routinely deal with numbers spanning many orders of magnitude: weights around $10^0$, gradients as small as $10^{-8}$, attention logits that can spike to $10^3$, and accumulations over thousands of values. A format that can't represent tiny gradients kills learning (they become zero). A format that can't represent large attention logits kills stability (they become infinity). A format that rounds too aggressively corrupts the running statistics that normalization layers depend on.
+This matters because during training, we routinely deal with numbers spanning many orders of magnitude: weights around $1$ ($10^0$), gradients as small as $10^{-8}$, attention logits that can spike to $10^3$, and accumulations over thousands of values. A format that can't represent tiny gradients kills learning (they become zero). A format that can't represent large attention logits kills stability (they become infinity). A format that rounds too aggressively corrupts the running statistics that normalization layers depend on.
 
 The fundamental question this notebook answers is: **when can we get away with lower resolution, and when does it break training?**
 
