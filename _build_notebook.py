@@ -335,73 +335,142 @@ def _smallest_subnormal(dtype):
         return None
 
 rows = []
-formats = [
-    # FP8 is increasingly common for LLM training/inference, but support depends on HW + kernel stack.
-    ("FP8 (E4M3)", getattr(torch, "float8_e4m3fn", None), 4, 3),
-    ("FP8 (E5M2)", getattr(torch, "float8_e5m2", None), 5, 2),
-    ("FP16 (IEEE half)", torch.float16, 5, 10),
-    ("BF16 (brain float)", torch.bfloat16, 8, 7),
-    ("FP32 (single)", torch.float32, 8, 23),
-    ("FP64 (double)", torch.float64, 11, 52),
+format_specs = [
+    # FP8 rows are included even if float8 dtypes are unavailable at runtime.
+    {
+        "name": "FP8 (E4M3)",
+        "dtype": getattr(torch, "float8_e4m3fn", None),
+        "exp_bits": 4,
+        "mant_bits": 3,
+        "fallback": {
+            "bits": 8,
+            "eps": "1.25e-01",
+            "ulp1": "1.25e-01",
+            "tiny": "1.56e-02",
+            "sub": "1.95e-03",
+            "max": "4.48e+02",
+            "exp_range": "[-6, 7]",
+        },
+    },
+    {
+        "name": "FP8 (E5M2)",
+        "dtype": getattr(torch, "float8_e5m2", None),
+        "exp_bits": 5,
+        "mant_bits": 2,
+        "fallback": {
+            "bits": 8,
+            "eps": "2.50e-01",
+            "ulp1": "2.50e-01",
+            "tiny": "6.10e-05",
+            "sub": "1.53e-05",
+            "max": "5.73e+04",
+            "exp_range": "[-14, 15]",
+        },
+    },
+    {
+        "name": "FP16 (IEEE half)",
+        "dtype": torch.float16,
+        "exp_bits": 5,
+        "mant_bits": 10,
+        "fallback": None,
+    },
+    {
+        "name": "BF16 (brain float)",
+        "dtype": torch.bfloat16,
+        "exp_bits": 8,
+        "mant_bits": 7,
+        "fallback": None,
+    },
+    {
+        "name": "FP32 (single)",
+        "dtype": torch.float32,
+        "exp_bits": 8,
+        "mant_bits": 23,
+        "fallback": None,
+    },
+    {
+        "name": "TF32 (tensor float)",
+        "dtype": None,
+        "exp_bits": 8,
+        "mant_bits": 10,
+        "fallback": {
+            "bits": "19*",
+            "eps": "9.77e-04",
+            "ulp1": "9.77e-04",
+            "tiny": "1.18e-38",
+            "sub": "n/a (internal)",
+            "max": "3.40e+38",
+            "exp_range": "[-126, 127]",
+        },
+    },
+    {
+        "name": "FP64 (double)",
+        "dtype": torch.float64,
+        "exp_bits": 11,
+        "mant_bits": 52,
+        "fallback": None,
+    },
 ]
 
-for name, dt, exp_b, mant_b in formats:
-    if dt is None:
-        continue
-    try:
-        fi = torch.finfo(dt)
-    except Exception:
-        continue
+for spec in format_specs:
+    name = spec["name"]
+    dt = spec["dtype"]
+    exp_b = spec["exp_bits"]
+    mant_b = spec["mant_bits"]
+    fb = spec["fallback"]
 
-    ulp1 = _ulp_at_one(dt)
-    sub = _smallest_subnormal(dt)
+    runtime_available = False
+    if name.startswith("TF32"):
+        runtime_available = (device.type == "cuda")
+
+    fi = None
+    if dt is not None:
+        try:
+            fi = torch.finfo(dt)
+            runtime_available = True
+        except Exception:
+            fi = None
+
+    if fi is not None:
+        ulp1 = _ulp_at_one(dt)
+        sub = _smallest_subnormal(dt)
+        bits = fi.bits
+        exp_range = f"[{-2**(exp_b-1)+2}, {2**(exp_b-1)-1}]"
+        eps_s = f"{fi.eps:.2e}"
+        ulp_s = f"{ulp1:.2e}" if ulp1 is not None else "n/a"
+        tiny_s = f"{fi.tiny:.2e}"
+        sub_s = f"{sub:.2e}" if sub is not None else "n/a"
+        max_s = f"{fi.max:.2e}"
+    else:
+        bits = fb["bits"] if fb is not None else "n/a"
+        exp_range = fb["exp_range"] if fb is not None else "n/a"
+        eps_s = fb["eps"] if fb is not None else "n/a"
+        ulp_s = fb["ulp1"] if fb is not None else "n/a"
+        tiny_s = fb["tiny"] if fb is not None else "n/a"
+        sub_s = fb["sub"] if fb is not None else "n/a"
+        max_s = fb["max"] if fb is not None else "n/a"
 
     rows.append({
         "Format": name,
-        "Total bits": fi.bits,
+        "Available in this runtime": "yes" if runtime_available else "no",
+        "Total bits": bits,
         "Exponent bits": exp_b,
         "Mantissa bits": mant_b,
         "Precision bits (incl hidden 1)": mant_b + 1,
         "Approx decimal digits": round((mant_b + 1) * math.log10(2), 1),
-        "Exponent range": f"[{-2**(exp_b-1)+2}, {2**(exp_b-1)-1}]",
-        "epsilon (ULP at 1.0)": f"{fi.eps:.2e}",
-        "ULP at 1.0": f"{ulp1:.2e}" if ulp1 is not None else "n/a",
-        "Min normal": f"{fi.tiny:.2e}",
-        "Min subnormal": f"{sub:.2e}" if sub is not None else "n/a",
-        "Max finite": f"{fi.max:.2e}",
+        "Exponent range": exp_range,
+        "epsilon (ULP at 1.0)": eps_s,
+        "ULP at 1.0": ulp_s,
+        "Min normal": tiny_s,
+        "Min subnormal": sub_s,
+        "Max finite": max_s,
     })
-
-# Add TF32 manually (not a storable dtype in PyTorch, but important to know)
-tf32_row = {
-    "Format": "TF32 (tensor float)",
-    "Total bits": "19*",
-    "Exponent bits": 8,
-    "Mantissa bits": 10,
-    "Precision bits (incl hidden 1)": 11,
-    "Approx decimal digits": 3.3,
-    "Exponent range": "[-126, 127]",
-    "epsilon (ULP at 1.0)": "9.77e-04",
-    "ULP at 1.0": "9.77e-04",
-    "Min normal": "1.18e-38",
-    "Min subnormal": "n/a (internal)",
-    "Max finite": "3.40e+38",
-}
-
-# Insert TF32 right after FP32 if present; otherwise append.
-insert_at = None
-for i, r in enumerate(rows):
-    if r["Format"].startswith("FP32"):
-        insert_at = i + 1
-        break
-if insert_at is None:
-    rows.append(tf32_row)
-else:
-    rows.insert(insert_at, tf32_row)
 
 df_cheat = pd.DataFrame(rows).set_index("Format")
 display(df_cheat)
 
 print()
+print("Rows marked 'no' still show reference values so the table stays complete.")
 print("* TF32 is not a storage format. It is used internally by Tensor Cores on")
 print("  Ampere+ GPUs for FP32 matmuls: FP32 range, but only 10 mantissa bits.")
 print("  Your 'FP32 baseline' on Ampere+ may secretly be TF32 precision.")
@@ -2338,60 +2407,8 @@ Standard IEEE 754 rounding is **deterministic** (round-to-nearest, ties-to-even)
 The expected value of the rounded result is $x$ itself — it's an **unbiased** estimator. Over many steps, small updates that would be systematically rounded away under deterministic rounding instead *accumulate on average*.
 
 **Connection to AMP:** Modern autocast doesn't use stochastic rounding (it uses standard IEEE rounding). Instead, it achieves a similar effect by keeping accumulations and updates in FP32, where the deterministic rounding error is small enough not to matter. But in FP8 and other extreme low-precision formats, stochastic rounding is actively used in some training frameworks.
-""")
 
-code(r"""
-# Stochastic rounding demo: accumulate tiny updates in FP16
-
-def stochastic_round_fp16(x_fp32):
-    # Round FP32 value to FP16 with stochastic rounding.
-    x_lo = torch.tensor(float(x_fp32), dtype=torch.float16).float()
-    x_hi = torch.nextafter(torch.tensor(float(x_fp32), dtype=torch.float16),
-                           torch.tensor(float("inf"), dtype=torch.float16)).float()
-    if float(x_hi) == float(x_lo):
-        return torch.tensor(float(x_lo), dtype=torch.float16)
-    # Probability of rounding up
-    p_up = (x_fp32 - x_lo) / (x_hi - x_lo + 1e-30)
-    p_up = float(p_up.clamp(0, 1))
-    if random.random() < p_up:
-        return torch.tensor(float(x_hi), dtype=torch.float16)
-    else:
-        return torch.tensor(float(x_lo), dtype=torch.float16)
-
-# Accumulate 1.0 + delta * N with delta below FP16 epsilon
-delta = 1e-4
-N = 5000
-expected = 1.0 + delta * N  # 1.5
-
-# Deterministic rounding (standard)
-w_det = torch.tensor(1.0, dtype=torch.float16)
-for _ in range(N):
-    w_det = (w_det.float() + delta).half()  # deterministic round
-
-# Stochastic rounding
-set_seed(42)
-w_stoch = torch.tensor(1.0, dtype=torch.float16)
-for _ in range(N):
-    w_stoch = stochastic_round_fp16(w_stoch.float() + delta)
-
-# FP32 reference
-w_fp32 = torch.tensor(1.0, dtype=torch.float32)
-for _ in range(N):
-    w_fp32 = w_fp32 + delta
-
-print(f"Accumulating {N} updates of delta={delta} starting from 1.0")
-print(f"Expected result: {expected}")
-print(f"  FP16 deterministic: {float(w_det):.6f}  (error: {abs(float(w_det) - expected):.4e})")
-print(f"  FP16 stochastic:    {float(w_stoch):.6f}  (error: {abs(float(w_stoch) - expected):.4e})")
-print(f"  FP32 deterministic: {float(w_fp32):.6f}  (error: {abs(float(w_fp32) - expected):.4e})")
-print()
-print("With deterministic rounding, the delta is below FP16's ULP at 1.0 (~1e-3),")
-print("so it gets rounded away EVERY time. The weight never moves.")
-print("With stochastic rounding, each update has a small probability of 'counting',")
-print("so the weight drifts toward the correct value over many steps.")
-print()
-print("Modern AMP avoids this issue by doing updates in FP32 (where delta > ULP),")
-print("but stochastic rounding remains relevant for FP8 training and research.")
+To keep this entire section purely literature and prose, the runnable stochastic-rounding experiment appears in **Section 3.5.1**.
 """)
 
 
@@ -3814,6 +3831,62 @@ print("\nFP16: delta=1e-5 is below ULP at 1.0 (~1e-3). Weight NEVER changes.")
 print("BF16: delta=1e-5 is below ULP at 1.0 (~8e-3). Weight NEVER changes.")
 print("FP32: delta=1e-5 is above ULP at 1.0 (~1e-7). Weight changes every step.")
 print("\nThis is why optimizers need FP32 master weights.")
+""")
+
+md(r"""
+### 3.5.1 Stochastic rounding micro-demo (why low-precision rounding mode matters)
+
+Section 2 introduced the idea from Gupta et al.: deterministic rounding can bias tiny updates toward zero, while stochastic rounding is unbiased in expectation.
+
+This demo intentionally uses an update (`1e-4`) below FP16's ULP at `1.0` (~`1e-3`) to show the behavior directly.
+""")
+
+code(r"""
+# Stochastic rounding demo: accumulate tiny updates in FP16
+
+def stochastic_round_fp16(x_fp32):
+    # Round FP32 value to FP16 with stochastic rounding.
+    x_lo = torch.tensor(float(x_fp32), dtype=torch.float16).float()
+    x_hi = torch.nextafter(
+        torch.tensor(float(x_fp32), dtype=torch.float16),
+        torch.tensor(float("inf"), dtype=torch.float16),
+    ).float()
+    if float(x_hi) == float(x_lo):
+        return torch.tensor(float(x_lo), dtype=torch.float16)
+    p_up = (x_fp32 - x_lo) / (x_hi - x_lo + 1e-30)
+    p_up = float(p_up.clamp(0, 1))
+    if random.random() < p_up:
+        return torch.tensor(float(x_hi), dtype=torch.float16)
+    return torch.tensor(float(x_lo), dtype=torch.float16)
+
+delta = 1e-4
+N = 5000
+expected = 1.0 + delta * N
+
+# Deterministic FP16 rounding
+w_det = torch.tensor(1.0, dtype=torch.float16)
+for _ in range(N):
+    w_det = (w_det.float() + delta).half()
+
+# Stochastic FP16 rounding
+set_seed(42)
+w_stoch = torch.tensor(1.0, dtype=torch.float16)
+for _ in range(N):
+    w_stoch = stochastic_round_fp16(w_stoch.float() + delta)
+
+# FP32 reference
+w_fp32 = torch.tensor(1.0, dtype=torch.float32)
+for _ in range(N):
+    w_fp32 = w_fp32 + delta
+
+print(f"Accumulating {N} updates of delta={delta} from 1.0")
+print(f"Expected: {expected:.6f}")
+print(f"  FP16 deterministic: {float(w_det):.6f}  (error: {abs(float(w_det) - expected):.4e})")
+print(f"  FP16 stochastic:    {float(w_stoch):.6f}  (error: {abs(float(w_stoch) - expected):.4e})")
+print(f"  FP32 deterministic: {float(w_fp32):.6f}  (error: {abs(float(w_fp32) - expected):.4e})")
+print()
+print("Deterministic FP16 rounds each tiny update away. Stochastic FP16 preserves")
+print("the update in expectation. AMP avoids this in practice by updating in FP32.")
 """)
 
 
