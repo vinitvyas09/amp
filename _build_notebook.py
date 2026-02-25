@@ -115,9 +115,14 @@ This notebook is organized into **three sections**:
 - NVIDIA mixed precision guidance
 - BF16 design intent
 - PyTorch AMP operator policy
+- PyTorch AMP examples: accumulation, penalties, multi-optimizer patterns
+- `torch.amp` API modernization + backend portability
+- Thread-local autocast semantics + nested precision regions
 - **Stochastic rounding**: why it helps low-precision training (Gupta et al.)
 - Rajbhandari et al. — ZeRO and optimizer state precision
 - LLM training stacks (FSDP/ZeRO) and where AMP fits
+- FP8 in practice: row-wise scaling + float8 all-gather (FSDP2)
+- Blackwell-era microscaling (MXFP8 / NVFP4)
 - FP8 and 8-bit optimizers
 
 **Section 3 — Practicalities**
@@ -2198,9 +2203,12 @@ md(r"""
 | NVIDIA mixed precision guidance | Engineering intuition + failure modes | Underflow/overflow + "sensitive ops in FP32" |
 | PyTorch `torch.amp` docs | The actual API + gotchas | `autocast` + `GradScaler` loops in Section 3 |
 | PyTorch autocast op reference | *The* per-op policy | Probed empirically in Section 3.2 |
+| PyTorch AMP examples page | Exact operational order for edge cases (accumulation, penalty, multi-optimizer) | Section 2.9.1, Section 3.10 |
 | Rajbhandari et al. (2020) — ZeRO | Memory breakdown of mixed-precision training at scale | Optimizer state precision, Section 2.6 |
 | Distributed training docs (FSDP/ZeRO/DeepSpeed) | Where dtypes live in large systems | Section 2.7 |
 | FP8 literature (e.g., NVIDIA) | Why FP8 needs scaling (E4M3 vs E5M2) + where it fits vs AMP | Section 1 tables, Section 3 practical guidance |
+| PyTorch float8 + FSDP2 blogs/tutorials | What actually closes the convergence gap at scale (rowwise scaling, float8 all-gather) | Section 2.11.1 |
+| NVIDIA Transformer Engine primer | Blackwell-era microscaling formats (MXFP8/NVFP4) and stochastic rounding direction | Section 2.11.2 |
 | Dettmers et al. (8-bit optimizers) | Optimizer-state precision as the next bottleneck after AMP | Section 2.6 memory discussion |
 
 If you only read one thing: read the Micikevicius paper, then read the PyTorch autocast op reference.
@@ -2394,6 +2402,55 @@ Since backpropagation is linear (gradients are proportional to the loss), every 
 """)
 
 md(r"""
+## 2.9.1 What the official AMP examples add (beyond the canonical loop)
+
+PyTorch's [AMP examples page](https://docs.pytorch.org/docs/stable/notes/amp_examples.html) is the best source for tricky loop mechanics that are easy to get subtly wrong.
+
+**1) Gradient accumulation is "effective-batch scoped".**
+
+During microbatch accumulation, grads should stay **scaled** and the scale factor should remain constant until the effective batch is complete. The correct order is:
+- scale/backward on each microbatch
+- unscale once (optional, right before clipping/inspection)
+- step once
+- update once
+
+If you unscale too early (mid-accumulation), later backwards add scaled grads to already-unscaled grads, and you lose mathematical equivalence.
+
+**2) `unscale_` is one-shot per optimizer per step.**
+
+The examples explicitly note that calling `scaler.unscale_(optimizer)` twice between optimizer steps raises a runtime error. This matters in larger codebases where clipping/logging utilities may each try to unscale.
+
+**3) Multi-loss / multi-optimizer logic is per-loss scaling, per-optimizer stepping, single update.**
+
+For multiple losses, call `scaler.scale(loss_i)` on each relevant loss. For multiple optimizers, call `scaler.step(optimizer_i)` for each optimizer, then `scaler.update()` once at the end of the iteration.
+
+**4) Gradient penalties with `autograd.grad` require manual inverse scaling.**
+
+When using `torch.autograd.grad` to build a penalty term, scale the outputs passed into `autograd.grad`, then manually divide the returned gradients by `scaler.get_scale()` before composing the penalty. Those gradients are not tied to an optimizer yet, so `unscale_` cannot do it for you.
+""")
+
+md(r"""
+## 2.9.2 API modernization and backend portability (`torch.amp`)
+
+The modern PyTorch API is device-agnostic:
+- `torch.amp.autocast(device_type=..., dtype=...)`
+- `torch.amp.GradScaler(device_type, ...)`
+
+The older namespace-specific APIs (`torch.cuda.amp.*`, `torch.cpu.amp.*`) are being deprecated in favor of this unified interface.
+
+**Autocast availability is now explicit:** `torch.amp.autocast_mode.is_autocast_available(device_type)` lets you guard backend-specific paths. The docs list support surfaces beyond CUDA/CPU, including backends such as XPU/HPU/MTIA/MAIA.
+
+**Autocast state is thread-local.** This is easy to miss in multi-GPU code:
+- each thread/process needs its own autocast context
+- in `DataParallel`/multi-GPU-per-process `DistributedDataParallel`, this can affect where autocast is enabled
+
+**Nested precision regions are a first-class pattern.** You can use `autocast(enabled=False)` subregions for numerically sensitive code, but tensors produced in outer low-precision regions may need explicit casts when entering the disabled block.
+
+**JIT caveat:** the AMP docs still document disabling the JIT autocast pass in some tracing/freeze workflows due to known issues.
+They also note that dtype mismatch errors inside an autocast-enabled region should be treated as bugs and reported upstream.
+""")
+
+md(r"""
 ## 2.10 Gupta et al. (2015): *Deep Learning with Limited Numerical Precision*
 
 This earlier line of work is worth knowing because it frames low-precision training as a **numerical analysis problem**, not a hardware trick.
@@ -2475,6 +2532,32 @@ This makes FP8 closer to **learned quantization with dynamic scaling** than to t
 - Libraries like NVIDIA Transformer Engine integrate FP8 into the training loop with per-tensor delayed scaling (using amax history from previous iterations).
 """)
 
+md(r"""
+### 2.11.1 What changed in 2024: row-wise scaling and float8 + FSDP2
+
+Recent PyTorch production writeups added an important correction to early FP8 intuition: **scaling granularity is often the deciding factor for convergence.**
+
+From PyTorch's float8/FSDP2 blogs and tutorials:
+- naive tensor-wise scaling can underperform BF16 at large scale (outlier sensitivity)
+- **row-wise scaling** substantially reduces quantization error and was reported to recover convergence while improving throughput (roughly 34–43% in reported large-model runs)
+- pairing float8 compute with **float8 all-gather** in FSDP2 reduces communication bandwidth pressure
+- stack-level tuning (`torch.compile`, distributed overlap, checkpointing choices) is required for end-to-end gains
+
+The practical takeaway is that "FP8 success" is not just a dtype flag. It's a systems recipe: scaling strategy + communication dtype + compiler/runtime integration.
+""")
+
+md(r"""
+### 2.11.2 Beyond Hopper FP8: MXFP8 and NVFP4 (Blackwell direction)
+
+NVIDIA's Transformer Engine primer describes where low precision is heading on Blackwell-class systems:
+
+- **MXFP8 (microscaling FP8):** block-level scaling metadata instead of a single scale per tensor, reducing sensitivity to outliers and making E4M3 usable in more paths.
+- **NVFP4:** a 4-bit floating format with additional scaling structure (including fine-grained blocks and higher-precision fallback scales) aimed at pushing training/inference efficiency further.
+- **Stochastic rounding** becomes more important again at these precisions to avoid systematic update bias.
+
+Conceptually, this extends AMP's core idea ("precision should follow numerical risk") into a regime where **scaling metadata and rounding mode** are first-class parts of the training graph.
+""")
+
 
 md(r"""
 ## 2.12 8-bit optimizer-state work: the next bottleneck after AMP
@@ -2526,9 +2609,13 @@ md(r"""
 | **Kalamkar et al.** | BF16's 8-bit exponent matches FP32 → no underflow → no loss scaling needed |
 | **NVIDIA guidance** | Engineering view: Tensor Cores, dimension alignment, bandwidth savings |
 | **PyTorch AMP docs** | The per-op dispatch table (the "decoder ring" for debugging) |
+| **PyTorch AMP examples** | Correct ordering for accumulation, penalties, and multi-optimizer loops |
+| **`torch.amp` unified API** | Device-agnostic AMP + backend availability checks + thread-local caveats |
 | **ZeRO (Rajbhandari et al.)** | Memory breakdown: 16 bytes/param with Adam mixed precision |
 | **Distributed stacks** | Precision applies to params, grads, optimizer state, and communication separately |
 | **FP8 literature** | FP8 needs explicit scaling + specialized kernels; not a drop-in autocast dtype |
+| **PyTorch float8 + FSDP2 work** | Row-wise scaling + float8 collectives are key for practical FP8 convergence/perf |
+| **Blackwell TE direction** | Microscaling formats (MXFP8/NVFP4) push scaling metadata into the core loop |
 | **8-bit optimizers** | Optimizer-state precision is the next memory target after AMP |
 
 **The single most useful reference for debugging:** the [PyTorch Autocast Op Reference](https://pytorch.org/docs/stable/amp.html#autocast-op-reference). Bookmark it.
@@ -5298,11 +5385,15 @@ md(r"""
 ## Documentation
 
 - [PyTorch `torch.amp` docs](https://pytorch.org/docs/stable/amp.html) — autocast op reference, GradScaler API
-- [PyTorch AMP examples](https://pytorch.org/docs/stable/notes/amp_examples.html) — canonical training loop
+- [PyTorch AMP examples](https://docs.pytorch.org/docs/stable/notes/amp_examples.html) — canonical loop + edge cases
+- [Autocast availability API](https://docs.pytorch.org/docs/stable/amp.html#torch.amp.autocast_mode.is_autocast_available) — backend support probing
 - [NVIDIA mixed precision blog](https://developer.nvidia.com/blog/mixed-precision-training-deep-neural-networks/)
 - [Google BF16 blog](https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus)
 - [DeepSpeed config docs](https://www.deepspeed.ai/docs/config-json/) — FP16/BF16 training config
 - [PyTorch FSDP mixed precision](https://pytorch.org/docs/stable/fsdp.html)
+- [PyTorch blog: Training with float8 and FSDP2](https://docs.pytorch.org/blog/training-using-float8-fsdp2/) — large-scale float8 practicals
+- [PyTorch tutorial: Supercharging training with float8 and FSDP2](https://docs.pytorch.org/tutorials/unstable/float8_fsdp2_tutorial.html) — implementation details and benchmarks
+- [NVIDIA Transformer Engine FP8 primer](https://docs.nvidia.com/deeplearning/transformer-engine/user-guide/examples/fp8_primer.html) — FP8/MXFP8/NVFP4 format and scaling details
 
 ---
 
