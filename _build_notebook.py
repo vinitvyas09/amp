@@ -1733,9 +1733,29 @@ md(r"""
 
 This is exactly what happens in **variance computation**: $\text{Var}(X) = E[X^2] - (E[X])^2$. If the mean is large relative to the standard deviation, both $E[X^2]$ and $(E[X])^2$ are large and nearly equal. The subtraction amplifies the rounding error in each term.
 
+**Why and how the amplification works.** Every floating-point format stores a number with a fixed number of significant digits (the mantissa). FP32 gets ~7 decimal digits of precision, BF16 ~2.4, FP16 ~3.3. Anything beyond that is rounded away *before the subtraction ever happens*.
+
+Consider our test case: data with mean $\mu = 10{,}000$ and $\sigma = 0.1$, so the true variance is $0.01$.
+
+The naive formula needs to compute:
+
+$$E[X^2] - (E[X])^2 \;\approx\; \underbrace{100{,}000{,}000.01}_{9 \text{ significant digits}} - \underbrace{100{,}000{,}000.00}_{9 \text{ significant digits}} = 0.01$$
+
+Both terms are $\sim\!10^8$, but their difference is $\sim\!10^{-2}$ — a factor of $10^{10}$ smaller. To recover the answer you'd need **10** significant decimal digits. But FP32 only has ~7, and BF16 only has ~2.4. So by the time the subtraction happens, both operands have already been rounded *identically* in their leading digits, and the answer is built from whatever noise the rounding left in the trailing digits.
+
+Concretely in **FP32** (~7 significant digits):
+- $E[X^2]$ is stored as something like $1.000000_{\;?} \times 10^8$ — the $0.01$ part falls below the precision floor
+- $(E[X])^2$ is stored as $1.000000_{\;?} \times 10^8$ — with its own, different rounding error
+- Subtraction cancels all 7 leading digits, leaving a result that's entirely the *difference of two rounding errors*
+- In the demo this gives $-8.0$ instead of $0.01$ — a **negative variance**, which is mathematically impossible. That minus sign is the hallmark of catastrophic cancellation.
+
+In **BF16** (~2.4 significant digits): both terms round to *exactly the same value*, so the subtraction returns $0$.
+
+In **FP16**: $10{,}000^2 = 10^8$ exceeds the FP16 max of $65{,}504$, so $E[X^2]$ overflows to `inf` and the result is `nan`.
+
 This is the mechanical reason **LayerNorm and BatchNorm statistics need FP32** under autocast.
 
-The "safe" formula avoids the cancellation: $\text{Var}(X) = E[(X - E[X])^2]$ -- subtract the mean *before* squaring, so you never form two large nearly-equal numbers.
+The "safe" formula sidesteps the problem by subtracting the mean *first*: $\text{Var}(X) = E[(X - \mu)^2]$. The centered values $(x_i - \mu)$ are $\sim\!0.1$, so their squares are $\sim\!0.01$ — numbers that comfortably fit in any format's precision. No large-minus-large subtraction ever occurs.
 """)
 
 code(r"""
@@ -2194,7 +2214,7 @@ md(r"""
 
 This is the foundational paper for everything in this notebook. It introduced the three-part recipe that all modern AMP implementations are based on.
 
-**The problem:** FP16 arithmetic is fast (2–8$\times$ throughput on Tensor Cores) and memory-efficient (half the bytes), but naively training in FP16 breaks. Models either diverge, produce NaN losses, or silently stagnate. The paper identifies three distinct failure modes:
+**The problem:** FP16 arithmetic is fast (2–8x throughput on Tensor Cores) and memory-efficient (half the bytes), but naively training in FP16 breaks. Models either diverge, produce NaN losses, or silently stagnate. The paper identifies three distinct failure modes:
 
 1. **Weight update stagnation.** When a weight $w$ is stored in FP16, the update $\Delta w = \eta \cdot g$ can be smaller than the ULP (unit in the last place) at $|w|$. The update is rounded away and the weight never changes. The paper's solution: maintain an FP32 "master copy" of all parameters. Forward and backward compute use the FP16 cast, but the actual parameter update happens in FP32 where the precision is sufficient to register small changes. The updated FP32 value is then cast back to FP16 for the next forward pass.
 
