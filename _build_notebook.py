@@ -3441,7 +3441,7 @@ if delta_rows:
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
 for row in act_results:
     label = f"{row['dtype']} {row['mode']}"
-    ls = "--" if "autocast" in row["mode"] else "-"
+    ls = "--" if row["mode"] == "autocast" else "-"
     axes[0].plot(row["x"], row["gelu_err"], label=label, ls=ls, alpha=0.7, lw=1.2)
     axes[1].plot(row["x"], row["relu_err"], label=label, ls=ls, alpha=0.7, lw=1.2)
 
@@ -3905,9 +3905,12 @@ configs = [
     ("D: params=FP32, autocast=ON",   torch.float32, True),
 ]
 
+import copy
+
 for title, param_dt, use_ac in configs:
     if TRACE_MODEL_KIND == "opt-125m" and trace_hf_model is not None:
-        model = trace_hf_model.to(param_dt).eval()
+        # Avoid mutating trace_hf_model in-place across configs.
+        model = copy.deepcopy(trace_hf_model).to(param_dt).eval()
         hooks, rec = install_dtype_hooks(model)
         ctx = amp_autocast(device, dtype_16, enabled=use_ac)
         with torch.inference_mode(), ctx:
@@ -3994,10 +3997,13 @@ code(r"""
 
 # Re-run the 4 configs to collect detailed per-module records for visualization.
 
+import copy
+
 all_config_records = {}
 for title, param_dt, use_ac in configs:
     if TRACE_MODEL_KIND == "opt-125m" and trace_hf_model is not None:
-        model_v = trace_hf_model.to(param_dt).eval()
+        # Keep trace_hf_model pristine for downstream sections (e.g., OPT training).
+        model_v = copy.deepcopy(trace_hf_model).to(param_dt).eval()
         hooks_v, rec_v = install_dtype_hooks(model_v)
         ctx_v = amp_autocast(device, dtype_16, enabled=use_ac)
         with torch.inference_mode(), ctx_v:
@@ -4233,12 +4239,14 @@ import copy
 set_seed(0)
 model_ref = TinyGPT(vocab_size=128, block_size=64, n_layer=2, n_embd=128, n_heads=4, dropout=0.0).to(device).float()
 idx_gs = torch.randint(0, 128, (2, 64), device=device)
+x_gs = idx_gs[:, :-1]
+y_gs = idx_gs[:, 1:]
 
 # Reference: full FP32 forward + backward
 model_ref.zero_grad()
-logits_ref = model_ref(idx_gs)
+logits_ref = model_ref(x_gs)
 loss_ref = F.cross_entropy(logits_ref.reshape(-1, logits_ref.size(-1)),
-                            idx_gs.reshape(-1))  # self-supervised: predict next token approx
+                            y_gs.reshape(-1))
 loss_ref.backward()
 ref_grads = {}
 for name, p in model_ref.named_parameters():
@@ -4279,9 +4287,9 @@ for mod_name, mod in model_ref.named_modules():
 
     model_test.zero_grad(set_to_none=True)
     try:
-        logits_test = model_test(idx_gs)
+        logits_test = model_test(x_gs)
         loss_test = F.cross_entropy(logits_test.reshape(-1, logits_test.size(-1)),
-                                     idx_gs.reshape(-1))
+                                     y_gs.reshape(-1))
         loss_test.backward()
     except Exception as exc:
         grad_sensitivity.append({"module": mod_name, "type": type(mod).__name__,
@@ -4328,20 +4336,17 @@ if len(df_gs) > 0:
         "Linear": "#2ecc71",
     }
     colors_gs = []
-    for t in mod_types:
-        matched = False
-        for key, col in color_map.items():
-            if key.lower() in t.lower():
-                colors_gs.append(col)
-                matched = True
-                break
-        if not matched:
-            if "attn" in t.lower() or "attention" in t.lower():
-                colors_gs.append("#3498db")
-            elif "mlp" in t.lower() or "sequential" in t.lower():
-                colors_gs.append("#2ecc71")
-            else:
-                colors_gs.append("#95a5a6")
+    for n, t in zip(mod_names, mod_types):
+        n_l = n.lower()
+        t_l = t.lower()
+        if "ln" in n_l or "norm" in n_l or "layernorm" in t_l:
+            colors_gs.append("#e74c3c")
+        elif "attn" in n_l or "attention" in n_l or "qkv" in n_l:
+            colors_gs.append("#3498db")
+        elif "mlp" in n_l or "ffn" in n_l or "fc" in n_l or "linear" in t_l:
+            colors_gs.append("#2ecc71")
+        else:
+            colors_gs.append("#95a5a6")
 
     y_pos = range(len(mod_names))
     ax.barh(y_pos, errs, color=colors_gs, alpha=0.8, edgecolor="white")
@@ -5777,7 +5782,7 @@ if trace_hf_model is not None and device.type == "cuda":
 
         model_t = _copy.deepcopy(trace_hf_model).to(cfg["param_dtype"]).train()
         opt_t = torch.optim.AdamW(model_t.parameters(), lr=OPT_LR, weight_decay=0.01)
-        scaler = GradScaler(device="cuda") if cfg["use_scaler"] else None
+        scaler = GradScaler(enabled=True) if cfg["use_scaler"] else None
 
         losses, grad_norms, zero_fracs = [], [], []
         status = "ok"
