@@ -6040,6 +6040,170 @@ To reduce fixed per-parameter memory, you need additional techniques:
 We'll compute the fixed-size accounting for a few common patterns and show what that looks like for our TinyGPT.
 """)
 
+md(r"""
+### 3.7.0 Where AMP memory savings *really* come from (measured on this model)
+
+Let's make this concrete with one controlled measurement on **the same TinyGPT model and same batch shape**:
+
+1. **FP32 training step** (no autocast)
+2. **AMP training step** (FP32 params + autocast)
+
+For each run we measure:
+- **Parameters** memory
+- **Gradients** memory
+- **Optimizer state** memory (AdamW moments, after first optimizer step)
+- **Activation peak** memory during forward
+
+This gives the exact intuition: AMP usually keeps fixed-size memory (params/grads/optimizer) close to FP32, while cutting activation memory substantially.
+""")
+
+code(r"""
+# Measured memory composition on TinyGPT: FP32 vs AMP (same hardware, same model shape)
+
+def _tensor_nbytes(t: torch.Tensor) -> int:
+    return int(t.numel()) * int(t.element_size())
+
+def _optimizer_state_nbytes(opt: torch.optim.Optimizer) -> int:
+    total = 0
+    for state in opt.state.values():
+        for v in state.values():
+            if isinstance(v, torch.Tensor):
+                total += _tensor_nbytes(v)
+    return int(total)
+
+def measure_memory_breakdown(use_autocast: bool, ac_dtype: torch.dtype | None, batch_size: int = 32, block_size: int = 64):
+    if device.type != "cuda":
+        raise RuntimeError("CUDA required for reliable activation memory profiling.")
+
+    set_seed(123)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.synchronize()
+
+    model_m = TinyGPT(vocab_size=vocab_size, block_size=block_size, n_layer=2, n_embd=128, n_heads=4, dropout=0.0).to(device).float()
+    opt_m = torch.optim.AdamW(model_m.parameters(), lr=3e-4)
+
+    # Fixed components from tensor dtypes.
+    param_bytes = sum(_tensor_nbytes(p) for p in model_m.parameters())
+
+    max_start = train_data.size(0) - block_size - 1
+    ix = torch.randint(0, max_start, (batch_size,), device=device)
+    offsets = torch.arange(block_size, device=device).unsqueeze(0)
+    xb = train_data[ix.unsqueeze(1) + offsets]
+    yb = train_data[ix.unsqueeze(1) + offsets + 1]
+
+    # Warm-up in the target precision path to reduce one-time kernel/workspace noise.
+    with torch.no_grad():
+        with amp_autocast(device, ac_dtype, enabled=use_autocast):
+            _ = model_m(xb[:2])
+    torch.cuda.synchronize()
+
+    # Baseline allocation after model + optimizer construction.
+    base_alloc = torch.cuda.memory_allocated()
+
+    # Forward (capture peak incremental memory, which is dominated by activations/workspaces).
+    torch.cuda.reset_peak_memory_stats()
+    model_m.zero_grad(set_to_none=True)
+    with amp_autocast(device, ac_dtype, enabled=use_autocast):
+        logits = model_m(xb)
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), yb.reshape(-1))
+    torch.cuda.synchronize()
+    forward_peak = torch.cuda.max_memory_allocated()
+    activation_peak_bytes = max(0, int(forward_peak - base_alloc))
+
+    # Backward to materialize gradients.
+    loss.backward()
+    grad_bytes = sum(_tensor_nbytes(p.grad) for p in model_m.parameters() if p.grad is not None)
+
+    # One optimizer step initializes AdamW moments (optimizer state memory).
+    opt_m.step()
+    opt_state_bytes = _optimizer_state_nbytes(opt_m)
+
+    out = {
+        "params_MB": param_bytes / 1024**2,
+        "grads_MB": grad_bytes / 1024**2,
+        "optimizer_MB": opt_state_bytes / 1024**2,
+        "activations_peak_MB": activation_peak_bytes / 1024**2,
+    }
+
+    # Cleanup
+    del model_m, opt_m, xb, yb, logits, loss
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    return out
+
+if device.type != "cuda":
+    print("CUDA not available. This measured FP32-vs-AMP activation breakdown requires CUDA.")
+else:
+    amp_dtype_mem = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+    fp32_mem = measure_memory_breakdown(use_autocast=False, ac_dtype=None)
+    amp_mem = measure_memory_breakdown(use_autocast=True, ac_dtype=amp_dtype_mem)
+
+    components = ["Parameters", "Gradients", "Optimizer state", "Activations (peak)"]
+    color_map_mem = {
+        "Parameters": "#1f77b4",
+        "Gradients": "#ff7f0e",
+        "Optimizer state": "#2ca02c",
+        "Activations (peak)": "#d62728",
+    }
+
+    fp32_vals = [fp32_mem["params_MB"], fp32_mem["grads_MB"], fp32_mem["optimizer_MB"], fp32_mem["activations_peak_MB"]]
+    amp_vals = [amp_mem["params_MB"], amp_mem["grads_MB"], amp_mem["optimizer_MB"], amp_mem["activations_peak_MB"]]
+
+    rows = []
+    for comp, a, b in zip(components, fp32_vals, amp_vals):
+        rows.append({
+            "component": comp,
+            "fp32_MB": float(f"{a:.2f}"),
+            f"amp_{str(amp_dtype_mem).replace('torch.', '')}_MB": float(f"{b:.2f}"),
+            "delta_MB": float(f"{(b - a):.2f}"),
+            "delta_pct": float(f"{(100.0 * (b - a) / max(a, 1e-9)):.2f}"),
+        })
+    display(pd.DataFrame(rows))
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
+    scenarios = [
+        ("FP32 (no autocast)", fp32_vals),
+        (f"AMP autocast ({str(amp_dtype_mem).replace('torch.', '')})", amp_vals),
+    ]
+
+    for ax, (title, vals) in zip(axes, scenarios):
+        bottom = 0.0
+        for comp, val in zip(components, vals):
+            ax.bar([0], [val], width=0.55, bottom=[bottom], color=color_map_mem[comp], edgecolor="white")
+            if val > 1.0:
+                ax.text(0, bottom + val / 2, f"{val:.1f} MB", ha="center", va="center",
+                        fontsize=8, color="white", fontweight="bold")
+            bottom += val
+        ax.set_title(title, fontsize=10)
+        ax.set_xticks([0])
+        ax.set_xticklabels(["TinyGPT step"])
+        ax.set_ylabel("Memory (MB)")
+        ax.set_xlim(-0.6, 0.6)
+        ax.text(0, bottom + 1.0, f"Total: {bottom:.1f} MB", ha="center", va="bottom",
+                fontsize=9, fontweight="bold")
+
+    from matplotlib.patches import Patch
+    legend_handles = [Patch(color=color_map_mem[k], label=k) for k in components]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=4, fontsize=8, bbox_to_anchor=(0.5, -0.02))
+    fig.suptitle("Memory composition per training step: FP32 vs AMP on the same model", fontsize=12, y=1.02)
+    plt.tight_layout()
+
+    act_save = fp32_mem["activations_peak_MB"] - amp_mem["activations_peak_MB"]
+    act_save_pct = 100 * act_save / max(fp32_mem["activations_peak_MB"], 1e-9)
+    total_fp32 = sum(fp32_vals)
+    total_amp = sum(amp_vals)
+    total_save_pct = 100 * (total_fp32 - total_amp) / max(total_fp32, 1e-9)
+
+    print("\nInterpretation:")
+    print("  - Parameters, gradients, and optimizer state stay in roughly the same range.")
+    print("  - The large drop is in activation memory under autocast.")
+    print(f"  - Activation peak savings: {act_save:.2f} MB ({act_save_pct:.1f}%)")
+    print(f"  - Total shown-memory savings: {total_save_pct:.1f}%")
+    print("  - This is why AMP's practical memory win is mainly 'more activation room' for bigger batch/sequence.")
+""")
+
 code(r"""
 # Fixed-size memory breakdown analysis (parameters + grads + optimizer state)
 
