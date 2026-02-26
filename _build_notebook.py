@@ -3300,7 +3300,7 @@ Autocast exists for two reasons:
 1. **Accumulation** — summing many terms compounds rounding error. A matmul of shape `[M, K] @ [K, N]` accumulates `K` products per output element. As `K` grows, FP16's 10-bit mantissa loses signal.
 2. **Exponentiation** — `exp(x)` amplifies errors and overflows in FP16 for `x > ~11`. Softmax depends on `exp`, so it's precision-sensitive.
 
-Below we test **three representative layer types** — attention, activation functions, and FFN linear layers — in **6 configurations** each: 3 dtypes (FP32, FP16, BF16) × 2 modes (no autocast, with autocast). All errors are measured against an FP64 reference.
+Below we test **three representative layer types** — attention, activation functions, and FFN linear layers — in up to **6 configurations** each: 3 dtypes (FP32, FP16, BF16) × 2 modes (no autocast, with autocast). (Some dtype/backend combos may be skipped if a kernel is unavailable.) All errors are measured against an FP64 reference.
 """)
 
 code(r"""
@@ -3329,20 +3329,27 @@ def attention_forward(q, k, v):
 w64, o64 = attention_forward(q64, k64, v64)
 
 attn_rows = []
+attn_skipped = []
 for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
     if not supports_dtype_on_device(dtype, device):
         continue
     for ac_label, use_ac in [("no autocast", False), ("autocast", True)]:
-        q_cast = q64.to(dtype)
-        k_cast = k64.to(dtype)
-        v_cast = v64.to(dtype)
-        if use_ac and device.type not in ("cuda", "cpu"):
-            continue
-        if use_ac:
-            with amp_autocast(device, dtype, enabled=True):
+        try:
+            q_cast = q64.to(dtype)
+            k_cast = k64.to(dtype)
+            v_cast = v64.to(dtype)
+            if use_ac:
+                with amp_autocast(device, dtype, enabled=True):
+                    w_test, o_test = attention_forward(q_cast, k_cast, v_cast)
+            else:
                 w_test, o_test = attention_forward(q_cast, k_cast, v_cast)
-        else:
-            w_test, o_test = attention_forward(q_cast, k_cast, v_cast)
+        except Exception as exc:
+            attn_skipped.append({
+                "dtype": dtype_name,
+                "mode": ac_label,
+                "reason": str(exc).splitlines()[0],
+            })
+            continue
         # Errors vs FP64
         w_err = float((w_test.double() - w64).abs().max())
         cos = float(F.cosine_similarity(o_test.double().flatten().unsqueeze(0),
@@ -3355,6 +3362,9 @@ for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF
 
 df_attn = pd.DataFrame(attn_rows)
 display(df_attn)
+if attn_skipped:
+    print("Skipped attention configs (unsupported dtype/backend path):")
+    display(pd.DataFrame(attn_skipped))
 
 # Plot: grouped bar chart
 if len(df_attn) > 0:
@@ -3380,7 +3390,7 @@ if len(df_attn) > 0:
 md(r"""
 **Observation (Attention):**
 - FP16 without autocast shows the **largest attention weight errors** — `exp()` in softmax amplifies small rounding differences into large distribution shifts.
-- On CUDA AMP policies, autocast usually routes softmax/reductions to FP32 while keeping matmuls in 16-bit, giving near-FP32-quality attention weights.
+- On many CUDA AMP policies, autocast routes softmax/reductions to FP32 while keeping matmuls in 16-bit, giving near-FP32-quality attention weights (verify with your local traces in Sections 3.2/3.3).
 - BF16's wider exponent range means it rarely overflows in softmax, but its lower mantissa precision still shows higher error than FP32.
 """)
 
@@ -3394,20 +3404,27 @@ relu_ref = F.relu(x64)
 gelu_ref = F.gelu(x64)
 
 act_results = []
+act_skipped = []
 for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
     if not supports_dtype_on_device(dtype, device):
         continue
     for ac_label, use_ac in [("no autocast", False), ("autocast", True)]:
-        x_cast = x64.to(dtype)
-        if use_ac and device.type not in ("cuda", "cpu"):
-            continue
-        if use_ac:
-            with amp_autocast(device, dtype, enabled=True):
+        try:
+            x_cast = x64.to(dtype)
+            if use_ac:
+                with amp_autocast(device, dtype, enabled=True):
+                    relu_out = F.relu(x_cast)
+                    gelu_out = F.gelu(x_cast)
+            else:
                 relu_out = F.relu(x_cast)
                 gelu_out = F.gelu(x_cast)
-        else:
-            relu_out = F.relu(x_cast)
-            gelu_out = F.gelu(x_cast)
+        except Exception as exc:
+            act_skipped.append({
+                "dtype": dtype_name,
+                "mode": ac_label,
+                "reason": str(exc).splitlines()[0],
+            })
+            continue
         relu_err = (relu_out.double() - relu_ref).abs()
         gelu_err = (gelu_out.double() - gelu_ref).abs()
         act_results.append({
@@ -3436,6 +3453,9 @@ for dtype_name in ["FP32", "FP16", "BF16"]:
 if delta_rows:
     print("Autocast-vs-no-autocast output deltas (same input dtype):")
     display(pd.DataFrame(delta_rows))
+if act_skipped:
+    print("Skipped activation configs (unsupported dtype/backend path):")
+    display(pd.DataFrame(act_skipped))
 
 # Plot: error vs input value
 fig, axes = plt.subplots(1, 2, figsize=(14, 5))
@@ -3455,14 +3475,14 @@ axes[1].set_xlabel("Input value")
 axes[1].set_ylabel("Absolute error")
 axes[1].legend(fontsize=7)
 
-fig.suptitle("Activation functions: autocast has NO effect (element-wise pass-through)", fontsize=12, y=1.02)
+fig.suptitle("Activation functions: in this setup, autocast adds little/no remapping", fontsize=12, y=1.02)
 plt.tight_layout()
 """)
 
 md(r"""
 **Observation (Activations):**
 - ReLU still inherits **input quantization error** (because positive outputs copy the rounded input), so error is small but generally not zero in FP16/BF16.
-- GELU shows larger low-precision error than ReLU (nonlinear approximation), but **autocast vs no-autocast curves overlap** at the same dtype.
+- GELU shows larger low-precision error than ReLU (nonlinear approximation), but **autocast vs no-autocast curves typically overlap** at the same dtype.
 - Takeaway: element-wise activations are usually pass-through for autocast policy; most error here comes from the input dtype itself, not autocast remapping.
 """)
 
@@ -3486,20 +3506,28 @@ b2_64 = torch.randn(D_MODEL, device=device, dtype=torch.float64) * 0.02
 y64 = F.linear(F.gelu(F.linear(x64_ffn, w1_64, b1_64)), w2_64, b2_64)
 
 ffn_results = []
+ffn_skipped = []
 for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
     if not supports_dtype_on_device(dtype, device):
         continue
     for ac_label, use_ac in [("no autocast", False), ("autocast", True)]:
-        if use_ac and device.type not in ("cuda", "cpu"):
-            continue
-        x_c = x64_ffn.to(dtype)
-        w1_c, b1_c = w1_64.to(dtype), b1_64.to(dtype)
-        w2_c, b2_c = w2_64.to(dtype), b2_64.to(dtype)
-        if use_ac:
-            with amp_autocast(device, dtype, enabled=True):
+        try:
+            x_c = x64_ffn.to(dtype)
+            w1_c, b1_c = w1_64.to(dtype), b1_64.to(dtype)
+            w2_c, b2_c = w2_64.to(dtype), b2_64.to(dtype)
+            if use_ac:
+                with amp_autocast(device, dtype, enabled=True):
+                    y_test = F.linear(F.gelu(F.linear(x_c, w1_c, b1_c)), w2_c, b2_c)
+            else:
                 y_test = F.linear(F.gelu(F.linear(x_c, w1_c, b1_c)), w2_c, b2_c)
-        else:
-            y_test = F.linear(F.gelu(F.linear(x_c, w1_c, b1_c)), w2_c, b2_c)
+        except Exception as exc:
+            ffn_skipped.append({
+                "dtype": dtype_name,
+                "mode": ac_label,
+                "phase": f"ffn_d{D_MODEL}",
+                "reason": str(exc).splitlines()[0],
+            })
+            continue
         rel_err = float((y_test.double() - y64).abs().mean() / (y64.abs().mean() + 1e-12))
         ffn_results.append({"dtype": dtype_name, "mode": ac_label, "mean_rel_err": rel_err})
 
@@ -3517,15 +3545,30 @@ for d in dims:
             continue
         a_c, b_c = a64.to(dtype), b64_mat.to(dtype)
         # No autocast
-        out_no_ac = (a_c @ b_c)
-        err_no_ac = float((out_no_ac.double() - ref).abs().mean() / (ref.abs().mean() + 1e-12))
-        scaling_results[dname]["no_ac"].append(err_no_ac)
+        try:
+            out_no_ac = (a_c @ b_c)
+            err_no_ac = float((out_no_ac.double() - ref).abs().mean() / (ref.abs().mean() + 1e-12))
+            scaling_results[dname]["no_ac"].append((d, err_no_ac))
+        except Exception as exc:
+            ffn_skipped.append({
+                "dtype": dname,
+                "mode": "no autocast",
+                "phase": f"matmul_d{d}",
+                "reason": str(exc).splitlines()[0],
+            })
         # With autocast
-        if device.type in ("cuda", "cpu"):
+        try:
             with amp_autocast(device, dtype, enabled=True):
                 out_ac = (a_c @ b_c)
             err_ac = float((out_ac.double() - ref).abs().mean() / (ref.abs().mean() + 1e-12))
-            scaling_results[dname]["ac"].append(err_ac)
+            scaling_results[dname]["ac"].append((d, err_ac))
+        except Exception as exc:
+            ffn_skipped.append({
+                "dtype": dname,
+                "mode": "autocast",
+                "phase": f"matmul_d{d}",
+                "reason": str(exc).splitlines()[0],
+            })
 
 # Plot
 fig, axes = plt.subplots(1, 2, figsize=(15, 5))
@@ -3552,10 +3595,14 @@ for dname, data in scaling_results.items():
         continue
     color, marker = style_map[dname]
     if data["no_ac"]:
-        ax.plot(dims[:len(data["no_ac"])], data["no_ac"], color=color, marker=marker,
+        x_no = [t[0] for t in data["no_ac"]]
+        y_no = [t[1] for t in data["no_ac"]]
+        ax.plot(x_no, y_no, color=color, marker=marker,
                 ls="-", label=f"{dname} (no autocast)", alpha=0.8)
     if data["ac"]:
-        ax.plot(dims[:len(data["ac"])], data["ac"], color=color, marker=marker,
+        x_ac = [t[0] for t in data["ac"]]
+        y_ac = [t[1] for t in data["ac"]]
+        ax.plot(x_ac, y_ac, color=color, marker=marker,
                 ls="--", label=f"{dname} (autocast)", alpha=0.5)
 
 ax.set_xlabel("Accumulation dimension (d)")
@@ -3567,14 +3614,17 @@ ax.legend(fontsize=7)
 
 fig.suptitle("FFN linear layers: accumulation error grows with dimension", fontsize=12, y=1.02)
 plt.tight_layout()
+if ffn_skipped:
+    print("Skipped FFN configs (unsupported dtype/backend path):")
+    display(pd.DataFrame(ffn_skipped))
 """)
 
 md(r"""
 **Observation (FFN Linear Layers):**
 - At `d_model=512`, FP16 error is ~10× higher than FP32. BF16 is in between (wider range, less mantissa precision).
-- The **right plot is the money plot**: FP16 matmul error grows roughly as $O(\sqrt{d})$ with the accumulation dimension, while FP32 stays nearly flat.
-- Autocast doesn't change the error much for *the matmul itself* — it's already running in 16-bit. What Tensor Cores do is **multiply in FP16 but accumulate in FP32**, which is the hardware-level fix.
-- **Takeaway:** The multiply can often be FP16/BF16, but high-precision accumulation is critical for quality; Tensor Cores provide this by accumulating matmuls in FP32.
+- The **right plot is the money plot**: in random-sum regimes, FP16 matmul error often follows an approximately $O(\sqrt{d})$ trend with accumulation dimension, while FP32 stays flatter.
+- Autocast usually doesn't change the matmul error much by itself because the multiply path remains low precision; on CUDA Tensor Cores, the key hardware fix is FP32 accumulation.
+- **Takeaway:** low-precision multiply can be fast, but high-precision accumulation is critical for quality.
 """)
 
 
@@ -3590,6 +3640,7 @@ code(r"""
 # Stress test: adversarial inputs for softmax, LayerNorm, and cross-entropy formulations
 
 stress_rows = []
+stress_skipped = []
 
 # ── Test 1: Softmax with nearly-identical large logits ──
 # In FP16, logits like [1000, 1000.001, 999.999] all round to the same value,
@@ -3601,22 +3652,30 @@ ref_softmax = torch.softmax(logits_64, dim=-1)
 for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
     if not supports_dtype_on_device(dtype, device):
         continue
-    logits_cast = logits_64.to(dtype)
-    probs_native = torch.softmax(logits_cast, dim=-1)    # softmax in native dtype
-    err = float((probs_native.double() - ref_softmax).abs().max())
-    spread = float((probs_native.max() - probs_native.min()).double())
-    is_degenerate = spread < 1e-6
-    stress_rows.append({
-        "test": "Softmax (large close logits)",
-        "dtype": dtype_name,
-        "max_error": f"{err:.6f}",
-        "degenerate": "YES" if is_degenerate else "no",
-        "detail": f"spread={spread:.3e}, probs={[f'{p:.4f}' for p in probs_native[0].tolist()]}",
-    })
+    try:
+        logits_cast = logits_64.to(dtype)
+        # softmax on cast inputs (some kernels may internally upcast)
+        probs_native = torch.softmax(logits_cast, dim=-1)
+        err = float((probs_native.double() - ref_softmax).abs().max())
+        spread = float((probs_native.max() - probs_native.min()).double())
+        is_degenerate = spread < 1e-6
+        stress_rows.append({
+            "test": "Softmax (large close logits)",
+            "dtype": dtype_name,
+            "max_error": f"{err:.6f}",
+            "degenerate": "YES" if is_degenerate else "no",
+            "detail": f"spread={spread:.3e}, probs={[f'{p:.4f}' for p in probs_native[0].tolist()]}",
+        })
+    except Exception as exc:
+        stress_skipped.append({
+            "test": "Softmax (large close logits)",
+            "dtype": dtype_name,
+            "reason": str(exc).splitlines()[0],
+        })
 
 # ── Test 2: LayerNorm with near-constant input (variance ≈ 0) ──
 # When all inputs are nearly identical, variance → 0, and dividing by sqrt(var+eps)
-# amplifies tiny differences. FP16's limited mantissa produces garbage.
+# amplifies tiny differences. Low precision can collapse these perturbations.
 
 near_const = torch.ones(1, 128, device=device, dtype=torch.float64) + \
     torch.randn(1, 128, device=device, dtype=torch.float64) * 1e-5
@@ -3628,21 +3687,28 @@ ref_ln = ln(near_const)
 for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
     if not supports_dtype_on_device(dtype, device):
         continue
-    ln_cast = nn.LayerNorm(128, device=device, dtype=dtype)
-    ln_cast.weight.data.fill_(1.0)
-    ln_cast.bias.data.fill_(0.0)
-    inp_cast = near_const.to(dtype)
-    out_cast = ln_cast(inp_cast)
-    err = float((out_cast.double() - ref_ln).abs().max())
-    out_std = float(out_cast.float().std(unbiased=False))
-    is_collapsed = out_std < 1e-6 or bool(torch.isnan(out_cast).any())
-    stress_rows.append({
-        "test": "LayerNorm (var≈0)",
-        "dtype": dtype_name,
-        "max_error": f"{err:.4f}",
-        "degenerate": "YES" if is_collapsed else "no",
-        "detail": f"std={out_std:.3e}, range=[{float(out_cast.min()):.4f}, {float(out_cast.max()):.4f}]",
-    })
+    try:
+        ln_cast = nn.LayerNorm(128, device=device, dtype=dtype)
+        ln_cast.weight.data.fill_(1.0)
+        ln_cast.bias.data.fill_(0.0)
+        inp_cast = near_const.to(dtype)
+        out_cast = ln_cast(inp_cast)
+        err = float((out_cast.double() - ref_ln).abs().max())
+        out_std = float(out_cast.float().std(unbiased=False))
+        is_collapsed = out_std < 1e-6 or bool(torch.isnan(out_cast).any())
+        stress_rows.append({
+            "test": "LayerNorm (var≈0)",
+            "dtype": dtype_name,
+            "max_error": f"{err:.4f}",
+            "degenerate": "YES" if is_collapsed else "no",
+            "detail": f"std={out_std:.3e}, range=[{float(out_cast.min()):.4f}, {float(out_cast.max()):.4f}]",
+        })
+    except Exception as exc:
+        stress_skipped.append({
+            "test": "LayerNorm (var≈0)",
+            "dtype": dtype_name,
+            "reason": str(exc).splitlines()[0],
+        })
 
 # ── Test 3: Cross-entropy decomposition vs fused implementation ──
 # Naively computing -log(softmax(logits)[target]) can produce log(0) in low precision.
@@ -3655,27 +3721,37 @@ ref_naive = -torch.log_softmax(logits_ce_64, dim=-1).gather(1, target_wrong[:, N
 for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
     if not supports_dtype_on_device(dtype, device):
         continue
-    logits_cast = logits_ce_64.to(dtype)
-    probs_cast = torch.softmax(logits_cast, dim=-1)
-    p_t = probs_cast.gather(1, target_wrong[:, None]).squeeze(1)
-    naive_ce = -torch.log(p_t)
-    fused_ce = F.cross_entropy(logits_cast, target_wrong)
-    naive_finite = bool(torch.isfinite(naive_ce).all())
-    if naive_finite:
-        err = float((naive_ce.double() - ref_naive).abs().max())
-        err_txt = f"{err:.6f}"
-    else:
-        err_txt = "inf/nan"
-    stress_rows.append({
-        "test": "CrossEntropy (naive log(softmax))",
-        "dtype": dtype_name,
-        "max_error": err_txt,
-        "degenerate": "YES" if not naive_finite else "no",
-        "detail": f"naive={float(naive_ce):.3g}, fused={float(fused_ce):.6f}",
-    })
+    try:
+        logits_cast = logits_ce_64.to(dtype)
+        probs_cast = torch.softmax(logits_cast, dim=-1)
+        p_t = probs_cast.gather(1, target_wrong[:, None]).squeeze(1)
+        naive_ce = -torch.log(p_t)
+        fused_ce = F.cross_entropy(logits_cast, target_wrong)
+        naive_finite = bool(torch.isfinite(naive_ce).all())
+        if naive_finite:
+            err = float((naive_ce.double() - ref_naive).abs().max())
+            err_txt = f"{err:.6f}"
+        else:
+            err_txt = "inf/nan"
+        stress_rows.append({
+            "test": "CrossEntropy (naive log(softmax))",
+            "dtype": dtype_name,
+            "max_error": err_txt,
+            "degenerate": "YES" if not naive_finite else "no",
+            "detail": f"naive={float(naive_ce):.3g}, fused={float(fused_ce):.6f}",
+        })
+    except Exception as exc:
+        stress_skipped.append({
+            "test": "CrossEntropy (naive log(softmax))",
+            "dtype": dtype_name,
+            "reason": str(exc).splitlines()[0],
+        })
 
 df_stress = pd.DataFrame(stress_rows)
 display(df_stress)
+if stress_skipped:
+    print("Skipped stress-test configs (unsupported dtype/backend path):")
+    display(pd.DataFrame(stress_skipped))
 
 # Summary bar plot
 fig, axes = plt.subplots(1, 3, figsize=(16, 5))
@@ -3937,16 +4013,16 @@ md(r"""
 
 **Config A (FP32, no autocast):** Everything is FP32. Baseline.
 
-**Config B (16-bit, no autocast):** Everything is 16-bit. No per-op policy. LayerNorm runs in 16-bit (risky for accumulation). Softmax runs in 16-bit (risky for overflow).
+**Config B (16-bit, no autocast):** Mostly 16-bit. No per-op autocast policy. Sensitive ops are more exposed to low-precision drift.
 
 **Config C (16-bit params, autocast ON):**
-- LayerNorm: input is 16-bit → **output is FP32** (autocast forces FP32 for normalization)
-- Linear after LayerNorm: **input is FP32 → output is 16-bit** (autocast casts FP32 weights/inputs to 16-bit for the matmul)
+- On common CUDA policies, LayerNorm frequently shows 16-bit input → **FP32 output** (autocast safety path for normalization).
+- Linear after LayerNorm often shows **FP32 input → 16-bit output** (autocast routes matmul compute to reduced precision).
 - This is the key insight: autocast doesn't just "use 16-bit everywhere." It routes different ops to different precisions.
 
 **Config D (FP32 params, autocast ON):**
-- Linear: **FP32 input → 16-bit output** (autocast temporarily casts FP32 weights to 16-bit!)
-- LayerNorm: FP32 → FP32 (stays in FP32, as it should)
+- Linear frequently appears as **FP32 input → 16-bit output** (autocast downcasts compute inputs/weights for matmul-like ops).
+- LayerNorm usually stays FP32 in these traces.
 - Residual adds: 16-bit + FP32 → **FP32** (dtype promotion)
 - This is the "standard" AMP configuration: model stays in FP32, autocast handles per-op casting.
 
@@ -4365,7 +4441,8 @@ if len(df_gs) > 0:
     print("Interpretation:")
     print("  - Bars are sorted from highest to lowest gradient sensitivity.")
     print("  - LayerNorm and attention modules typically dominate (reductions + softmax).")
-    print("  - Linear layers are usually safe in FP16 (Tensor Cores accumulate in FP32).")
+    print("  - Linear layers are often less sensitive than normalization/attention in this test.")
+    print("    (On CUDA Tensor Cores, FP32 accumulation in matmuls is a big reason.)")
     print("  - If you must keep some layers in FP32 for stability, prioritize the top bars.")
 else:
     print("No gradient sensitivity data collected (need TinyGPT defined above).")
@@ -4574,7 +4651,7 @@ The Micikevicius snapshot above is from early training. But gradient distributio
 
 Here we train TinyGPT for ~200 steps and capture full gradient snapshots at checkpoints, showing:
 1. How the gradient distribution shifts leftward (toward smaller magnitudes) over training.
-2. How loss scaling keeps the distribution within FP16's representable range.
+2. How a representative loss scale would shift that distribution into FP16's representable range.
 """)
 
 code(r"""
@@ -4673,7 +4750,7 @@ for step, grads in sorted(grad_snapshots.items()):
     frac_true_underflow = float((nonzero.abs() < min_sub_fp16).float().mean()) * 100
     print(f"  Step {step:>3d}: {frac_below_normal:.2f}% < min normal, {frac_true_underflow:.4f}% < min subnormal")
 print(f"\nTakeaway: As training converges, more gradients move into FP16's low-magnitude region.")
-print(f"Loss scaling (orange) shifts the distribution right, keeping gradients representable.")
+print(f"The orange overlay is a fixed-scale what-if (not dynamic GradScaler), showing why scaling helps.")
 
 del model_evo, opt_evo
 """)
@@ -5709,6 +5786,8 @@ We fine-tune for **60 steps** under 6 precision configurations:
 | 4 | `ac_fp32` | FP32 | ON | Yes | Canonical AMP baseline |
 | 5 | `ac_fp16` | FP16 | ON | Yes | Non-standard; may improve vs naive FP16 |
 | 6 | `ac_bf16` | BF16 | ON | No | Usually stable where BF16 is supported |
+
+These 6 runs intentionally vary **both** parameter dtype and autocast policy to show practical regimes you will encounter in real code, not just a single-axis ablation.
 
 > **Guard:** This section requires `trace_hf_model` (OPT-125M) loaded earlier + CUDA. Skipped otherwise.
 """)
