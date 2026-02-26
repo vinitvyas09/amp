@@ -2989,6 +2989,8 @@ else:
         for mp, p16 in zip(master_params_s, model_scaled.parameters()):
             if p16.grad is not None:
                 mp.grad = p16.grad.float() / LOSS_SCALE
+                # Unscale model grads too so grad_stats sees true magnitudes
+                p16.grad.div_(LOSS_SCALE)
 
         zf, mg = grad_stats(model_scaled)
 
@@ -3048,13 +3050,14 @@ for xb, yb in get_batches(PROG_STEPS):
 
     if scaler is not None:
         scaler.scale(loss).backward()
+        scaler.unscale_(opt_amp)
+        zf, mg = grad_stats(model_amp)
         scaler.step(opt_amp)
         scaler.update()
     else:
         loss.backward()
+        zf, mg = grad_stats(model_amp)
         opt_amp.step()
-
-    zf, mg = grad_stats(model_amp)
     log_amp["loss"].append(float(loss))
     log_amp["zero_grad_frac"].append(zf)
     log_amp["median_grad"].append(mg)
