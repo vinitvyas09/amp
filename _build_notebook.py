@@ -4330,11 +4330,6 @@ if len(df_gs) > 0:
     mod_types = df_gs["type"].tolist()
     errs = df_gs["grad_rel_err"].tolist()
 
-    color_map = {
-        "LayerNorm": "#e74c3c",
-        "CausalSelfAttention": "#3498db",
-        "Linear": "#2ecc71",
-    }
     colors_gs = []
     for n, t in zip(mod_names, mod_types):
         n_l = n.lower()
