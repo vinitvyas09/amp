@@ -129,12 +129,18 @@ This notebook is organized into **three sections**:
 - Progressive mixed-precision implementation from scratch (FP32 → naive FP16 → **naive BF16** → master weights → loss scaling → PyTorch AMP)
 - Build an operator policy table *from your local PyTorch*
 - The "sum vs mean" mystery
+- **Per-layer precision toy examples**: attention, activations, FFN — why autocast treats each differently
+- **Numerical stability stress tests**: adversarial inputs for softmax, LayerNorm, cross-entropy
 - Visualize dtype flow through a transformer (4 configurations)
-- **Per-layer precision sensitivity**: which parts of the transformer hurt most?
+- **Autocast boundary flow diagram**: visual dtype transitions per module across configs
+- **Per-layer precision sensitivity**: which parts of the transformer hurt most? (forward + backward)
+- **Per-layer gradient sensitivity**: which layers corrupt gradients the most in FP16?
 - Gradient underflow + the effect of loss scaling
 - **Micikevicius-style gradient histogram analysis**
+- **Gradient distribution evolution**: how the histogram shifts during training + loss scaling effect
 - Weight update stagnation
 - Train a tiny causal LM under different precision regimes (FP32, FP16 naive, BF16 naive, AMP FP16, AMP BF16)
+- **OPT-125M training loss curves**: real-world AMP on a 125M-parameter Hugging Face model (6 configs)
 - Plot and interpret loss/time/scale/gradient curves + summary bar charts
 
 ---
@@ -3284,6 +3290,434 @@ else:
 """)
 
 
+# ── 3.2.2 Per-layer precision toy examples ──────────────────────────────────
+
+md(r"""
+### 3.2.2 Per-layer precision toy examples: why autocast treats layers differently
+
+Autocast exists for two reasons:
+
+1. **Accumulation** — summing many terms compounds rounding error. A matmul of shape `[M, K] @ [K, N]` accumulates `K` products per output element. As `K` grows, FP16's 10-bit mantissa loses signal.
+2. **Exponentiation** — `exp(x)` amplifies errors and overflows in FP16 for `x > ~11`. Softmax depends on `exp`, so it's precision-sensitive.
+
+Below we test **three representative layer types** — attention, activation functions, and FFN linear layers — in **6 configurations** each: 3 dtypes (FP32, FP16, BF16) × 2 modes (no autocast, with autocast). All errors are measured against an FP64 reference.
+""")
+
+code(r"""
+# Cell A: Attention (Q·K^T → softmax → @V)
+#
+# Why precision-sensitive:
+#   - Two matmuls with accumulation
+#   - softmax with exp (overflow risk in FP16)
+
+set_seed(0)
+B, N_HEADS, SEQ, HEAD_DIM = 4, 4, 64, 32
+
+# Create random Q, K, V (scaled up by 5x to stress precision)
+q64 = torch.randn(B, N_HEADS, SEQ, HEAD_DIM, device=device, dtype=torch.float64) * 5
+k64 = q64.clone()
+v64 = torch.randn(B, N_HEADS, SEQ, HEAD_DIM, device=device, dtype=torch.float64) * 5
+
+def attention_forward(q, k, v):
+    scale = math.sqrt(q.size(-1))
+    scores = (q @ k.transpose(-2, -1)) / scale
+    weights = torch.softmax(scores, dim=-1)
+    output = weights @ v
+    return weights, output
+
+# FP64 reference
+w64, o64 = attention_forward(q64, k64, v64)
+
+attn_rows = []
+for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
+    if not supports_dtype_on_device(dtype, device):
+        continue
+    for ac_label, use_ac in [("no autocast", False), ("autocast", True)]:
+        q_cast = q64.to(dtype)
+        k_cast = k64.to(dtype)
+        v_cast = v64.to(dtype)
+        if use_ac and device.type not in ("cuda", "cpu"):
+            continue
+        if use_ac:
+            with amp_autocast(device, dtype, enabled=True):
+                w_test, o_test = attention_forward(q_cast, k_cast, v_cast)
+        else:
+            w_test, o_test = attention_forward(q_cast, k_cast, v_cast)
+        # Errors vs FP64
+        w_err = float((w_test.double() - w64).abs().max())
+        cos = float(F.cosine_similarity(o_test.double().flatten().unsqueeze(0),
+                                         o64.flatten().unsqueeze(0)))
+        entropy = float(-(w_test.double() * (w_test.double() + 1e-12).log()).sum(-1).mean())
+        attn_rows.append({
+            "dtype": dtype_name, "mode": ac_label,
+            "max_weight_err": w_err, "output_cos_sim": cos, "attn_entropy": entropy,
+        })
+
+df_attn = pd.DataFrame(attn_rows)
+display(df_attn)
+
+# Plot: grouped bar chart
+if len(df_attn) > 0:
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    labels = [f"{r['dtype']}\n{r['mode']}" for _, r in df_attn.iterrows()]
+    x = np.arange(len(labels))
+    colors = ["#e74c3c" if "FP16" in l else "#3498db" if "BF16" in l else "#2ecc71" for l in labels]
+
+    for ax, metric, title in zip(axes, ["max_weight_err", "output_cos_sim", "attn_entropy"],
+                                  ["Max Attention Weight Error", "Output Cosine Similarity (vs FP64)", "Attention Entropy"]):
+        vals = df_attn[metric].tolist()
+        bars = ax.bar(x, vals, color=colors, alpha=0.8, edgecolor="white")
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=7, rotation=30, ha="right")
+        ax.set_title(title, fontsize=10)
+        if metric == "max_weight_err":
+            ax.set_yscale("log")
+
+    fig.suptitle("Attention: precision effects on Q·K^T → softmax → @V", fontsize=12, y=1.02)
+    plt.tight_layout()
+""")
+
+md(r"""
+**Observation (Attention):**
+- FP16 without autocast shows the **largest attention weight errors** — `exp()` in softmax amplifies small rounding differences into large distribution shifts.
+- On CUDA AMP policies, autocast usually routes softmax/reductions to FP32 while keeping matmuls in 16-bit, giving near-FP32-quality attention weights.
+- BF16's wider exponent range means it rarely overflows in softmax, but its lower mantissa precision still shows higher error than FP32.
+""")
+
+code(r"""
+# Cell B: Activation Functions (ReLU vs GELU)
+#
+# Why interesting: Element-wise ops, no accumulation → autocast treats them as pass-through.
+
+x64 = torch.linspace(-10, 10, 10000, device=device, dtype=torch.float64)
+relu_ref = F.relu(x64)
+gelu_ref = F.gelu(x64)
+
+act_results = []
+for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
+    if not supports_dtype_on_device(dtype, device):
+        continue
+    for ac_label, use_ac in [("no autocast", False), ("autocast", True)]:
+        x_cast = x64.to(dtype)
+        if use_ac and device.type not in ("cuda", "cpu"):
+            continue
+        if use_ac:
+            with amp_autocast(device, dtype, enabled=True):
+                relu_out = F.relu(x_cast)
+                gelu_out = F.gelu(x_cast)
+        else:
+            relu_out = F.relu(x_cast)
+            gelu_out = F.gelu(x_cast)
+        relu_err = (relu_out.double() - relu_ref).abs()
+        gelu_err = (gelu_out.double() - gelu_ref).abs()
+        act_results.append({
+            "dtype": dtype_name, "mode": ac_label,
+            "relu_max_err": float(relu_err.max()),
+            "gelu_max_err": float(gelu_err.max()),
+            "x": x64.cpu().numpy(),
+            "relu_err": relu_err.cpu().numpy(),
+            "gelu_err": gelu_err.cpu().numpy(),
+            "relu_out": relu_out.float().cpu().numpy(),
+            "gelu_out": gelu_out.float().cpu().numpy(),
+        })
+
+# Quantify whether autocast itself changes activation outputs at a fixed dtype.
+delta_rows = []
+for dtype_name in ["FP32", "FP16", "BF16"]:
+    no_ac = next((r for r in act_results if r["dtype"] == dtype_name and r["mode"] == "no autocast"), None)
+    ac = next((r for r in act_results if r["dtype"] == dtype_name and r["mode"] == "autocast"), None)
+    if no_ac is None or ac is None:
+        continue
+    delta_rows.append({
+        "dtype": dtype_name,
+        "relu_max_delta(ac-vs-noac)": float(np.max(np.abs(ac["relu_out"] - no_ac["relu_out"]))),
+        "gelu_max_delta(ac-vs-noac)": float(np.max(np.abs(ac["gelu_out"] - no_ac["gelu_out"]))),
+    })
+if delta_rows:
+    print("Autocast-vs-no-autocast output deltas (same input dtype):")
+    display(pd.DataFrame(delta_rows))
+
+# Plot: error vs input value
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for row in act_results:
+    label = f"{row['dtype']} {row['mode']}"
+    ls = "--" if "autocast" in row["mode"] else "-"
+    axes[0].plot(row["x"], row["gelu_err"], label=label, ls=ls, alpha=0.7, lw=1.2)
+    axes[1].plot(row["x"], row["relu_err"], label=label, ls=ls, alpha=0.7, lw=1.2)
+
+axes[0].set_title("GELU absolute error vs FP64", fontsize=10)
+axes[0].set_xlabel("Input value")
+axes[0].set_ylabel("Absolute error")
+axes[0].legend(fontsize=7)
+
+axes[1].set_title("ReLU absolute error vs FP64 (the control)", fontsize=10)
+axes[1].set_xlabel("Input value")
+axes[1].set_ylabel("Absolute error")
+axes[1].legend(fontsize=7)
+
+fig.suptitle("Activation functions: autocast has NO effect (element-wise pass-through)", fontsize=12, y=1.02)
+plt.tight_layout()
+""")
+
+md(r"""
+**Observation (Activations):**
+- ReLU still inherits **input quantization error** (because positive outputs copy the rounded input), so error is small but generally not zero in FP16/BF16.
+- GELU shows larger low-precision error than ReLU (nonlinear approximation), but **autocast vs no-autocast curves overlap** at the same dtype.
+- Takeaway: element-wise activations are usually pass-through for autocast policy; most error here comes from the input dtype itself, not autocast remapping.
+""")
+
+code(r"""
+# Cell C: FFN Linear Layers (matmul accumulation)
+#
+# Why precision-sensitive: y = x @ W^T + b accumulates d_model products per output.
+
+set_seed(0)
+
+# Part 1: FFN at d_model=512
+D_MODEL = 512
+D_FF = 2048
+x64_ffn = torch.randn(4, 64, D_MODEL, device=device, dtype=torch.float64)
+w1_64 = torch.randn(D_FF, D_MODEL, device=device, dtype=torch.float64) * 0.02
+b1_64 = torch.randn(D_FF, device=device, dtype=torch.float64) * 0.02
+w2_64 = torch.randn(D_MODEL, D_FF, device=device, dtype=torch.float64) * 0.02
+b2_64 = torch.randn(D_MODEL, device=device, dtype=torch.float64) * 0.02
+
+# FP64 reference
+y64 = F.linear(F.gelu(F.linear(x64_ffn, w1_64, b1_64)), w2_64, b2_64)
+
+ffn_results = []
+for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
+    if not supports_dtype_on_device(dtype, device):
+        continue
+    for ac_label, use_ac in [("no autocast", False), ("autocast", True)]:
+        if use_ac and device.type not in ("cuda", "cpu"):
+            continue
+        x_c = x64_ffn.to(dtype)
+        w1_c, b1_c = w1_64.to(dtype), b1_64.to(dtype)
+        w2_c, b2_c = w2_64.to(dtype), b2_64.to(dtype)
+        if use_ac:
+            with amp_autocast(device, dtype, enabled=True):
+                y_test = F.linear(F.gelu(F.linear(x_c, w1_c, b1_c)), w2_c, b2_c)
+        else:
+            y_test = F.linear(F.gelu(F.linear(x_c, w1_c, b1_c)), w2_c, b2_c)
+        rel_err = float((y_test.double() - y64).abs().mean() / (y64.abs().mean() + 1e-12))
+        ffn_results.append({"dtype": dtype_name, "mode": ac_label, "mean_rel_err": rel_err})
+
+# Part 2: Accumulation error vs dimension
+dims = [32, 64, 128, 256, 512, 1024, 2048]
+scaling_results = {dname: {"no_ac": [], "ac": []} for dname in ["FP32", "FP16", "BF16"]}
+
+for d in dims:
+    set_seed(0)
+    a64 = torch.randn(64, d, device=device, dtype=torch.float64)
+    b64_mat = torch.randn(d, 64, device=device, dtype=torch.float64) * 0.02
+    ref = (a64 @ b64_mat)
+    for dname, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
+        if not supports_dtype_on_device(dtype, device):
+            continue
+        a_c, b_c = a64.to(dtype), b64_mat.to(dtype)
+        # No autocast
+        out_no_ac = (a_c @ b_c)
+        err_no_ac = float((out_no_ac.double() - ref).abs().mean() / (ref.abs().mean() + 1e-12))
+        scaling_results[dname]["no_ac"].append(err_no_ac)
+        # With autocast
+        if device.type in ("cuda", "cpu"):
+            with amp_autocast(device, dtype, enabled=True):
+                out_ac = (a_c @ b_c)
+            err_ac = float((out_ac.double() - ref).abs().mean() / (ref.abs().mean() + 1e-12))
+            scaling_results[dname]["ac"].append(err_ac)
+
+# Plot
+fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+
+# Left: grouped bars at d=512
+ax = axes[0]
+df_ffn = pd.DataFrame(ffn_results)
+if len(df_ffn) > 0:
+    labels = [f"{r['dtype']}\n{r['mode']}" for _, r in df_ffn.iterrows()]
+    x_pos = np.arange(len(labels))
+    colors = ["#e74c3c" if "FP16" in l else "#3498db" if "BF16" in l else "#2ecc71" for l in labels]
+    ax.bar(x_pos, df_ffn["mean_rel_err"].tolist(), color=colors, alpha=0.8, edgecolor="white")
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(labels, fontsize=7, rotation=30, ha="right")
+    ax.set_ylabel("Mean relative error vs FP64")
+    ax.set_title(f"FFN output error (d_model={D_MODEL})", fontsize=10)
+    ax.set_yscale("log")
+
+# Right: error vs dimension (the money plot)
+ax = axes[1]
+style_map = {"FP32": ("#2ecc71", "o"), "FP16": ("#e74c3c", "s"), "BF16": ("#3498db", "^")}
+for dname, data in scaling_results.items():
+    if dname not in style_map:
+        continue
+    color, marker = style_map[dname]
+    if data["no_ac"]:
+        ax.plot(dims[:len(data["no_ac"])], data["no_ac"], color=color, marker=marker,
+                ls="-", label=f"{dname} (no autocast)", alpha=0.8)
+    if data["ac"]:
+        ax.plot(dims[:len(data["ac"])], data["ac"], color=color, marker=marker,
+                ls="--", label=f"{dname} (autocast)", alpha=0.5)
+
+ax.set_xlabel("Accumulation dimension (d)")
+ax.set_ylabel("Mean relative error vs FP64")
+ax.set_title("Matmul error growth with dimension", fontsize=10)
+ax.set_xscale("log", base=2)
+ax.set_yscale("log")
+ax.legend(fontsize=7)
+
+fig.suptitle("FFN linear layers: accumulation error grows with dimension", fontsize=12, y=1.02)
+plt.tight_layout()
+""")
+
+md(r"""
+**Observation (FFN Linear Layers):**
+- At `d_model=512`, FP16 error is ~10× higher than FP32. BF16 is in between (wider range, less mantissa precision).
+- The **right plot is the money plot**: FP16 matmul error grows roughly as $O(\sqrt{d})$ with the accumulation dimension, while FP32 stays nearly flat.
+- Autocast doesn't change the error much for *the matmul itself* — it's already running in 16-bit. What Tensor Cores do is **multiply in FP16 but accumulate in FP32**, which is the hardware-level fix.
+- **Takeaway:** The multiply can often be FP16/BF16, but high-precision accumulation is critical for quality; Tensor Cores provide this by accumulating matmuls in FP32.
+""")
+
+
+# ── 3.2.3 Numerical stability stress tests ─────────────────────────────────
+
+md(r"""
+### 3.2.3 Numerical stability stress tests: adversarial inputs for sensitive ops
+
+The toy examples above show *average-case* error. But precision failures often happen at the **edges** — extreme inputs that push operations into overflow, underflow, or degenerate behavior. Here we craft adversarial inputs for three precision-sensitive ops.
+""")
+
+code(r"""
+# Stress test: adversarial inputs for softmax, LayerNorm, and cross-entropy formulations
+
+stress_rows = []
+
+# ── Test 1: Softmax with nearly-identical large logits ──
+# In FP16, logits like [1000, 1000.001, 999.999] all round to the same value,
+# erasing small ranking differences and collapsing toward a uniform distribution.
+
+logits_64 = torch.tensor([[1000.0, 1000.001, 999.999]], device=device, dtype=torch.float64)
+ref_softmax = torch.softmax(logits_64, dim=-1)
+
+for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
+    if not supports_dtype_on_device(dtype, device):
+        continue
+    logits_cast = logits_64.to(dtype)
+    probs_native = torch.softmax(logits_cast, dim=-1)    # softmax in native dtype
+    err = float((probs_native.double() - ref_softmax).abs().max())
+    spread = float((probs_native.max() - probs_native.min()).double())
+    is_degenerate = spread < 1e-6
+    stress_rows.append({
+        "test": "Softmax (large close logits)",
+        "dtype": dtype_name,
+        "max_error": f"{err:.6f}",
+        "degenerate": "YES" if is_degenerate else "no",
+        "detail": f"spread={spread:.3e}, probs={[f'{p:.4f}' for p in probs_native[0].tolist()]}",
+    })
+
+# ── Test 2: LayerNorm with near-constant input (variance ≈ 0) ──
+# When all inputs are nearly identical, variance → 0, and dividing by sqrt(var+eps)
+# amplifies tiny differences. FP16's limited mantissa produces garbage.
+
+near_const = torch.ones(1, 128, device=device, dtype=torch.float64) + \
+    torch.randn(1, 128, device=device, dtype=torch.float64) * 1e-5
+ln = nn.LayerNorm(128, device=device, dtype=torch.float64)
+ln.weight.data.fill_(1.0)
+ln.bias.data.fill_(0.0)
+ref_ln = ln(near_const)
+
+for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
+    if not supports_dtype_on_device(dtype, device):
+        continue
+    ln_cast = nn.LayerNorm(128, device=device, dtype=dtype)
+    ln_cast.weight.data.fill_(1.0)
+    ln_cast.bias.data.fill_(0.0)
+    inp_cast = near_const.to(dtype)
+    out_cast = ln_cast(inp_cast)
+    err = float((out_cast.double() - ref_ln).abs().max())
+    out_std = float(out_cast.float().std(unbiased=False))
+    is_collapsed = out_std < 1e-6 or bool(torch.isnan(out_cast).any())
+    stress_rows.append({
+        "test": "LayerNorm (var≈0)",
+        "dtype": dtype_name,
+        "max_error": f"{err:.4f}",
+        "degenerate": "YES" if is_collapsed else "no",
+        "detail": f"std={out_std:.3e}, range=[{float(out_cast.min()):.4f}, {float(out_cast.max()):.4f}]",
+    })
+
+# ── Test 3: Cross-entropy decomposition vs fused implementation ──
+# Naively computing -log(softmax(logits)[target]) can produce log(0) in low precision.
+# F.cross_entropy uses a stabilized logsumexp path and is typically finite.
+
+logits_ce_64 = torch.tensor([[50.0, -50.0, -50.0]], device=device, dtype=torch.float64)
+target_wrong = torch.tensor([1], device=device)  # intentionally low-probability class
+ref_naive = -torch.log_softmax(logits_ce_64, dim=-1).gather(1, target_wrong[:, None]).squeeze(1)
+
+for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF16", torch.bfloat16)]:
+    if not supports_dtype_on_device(dtype, device):
+        continue
+    logits_cast = logits_ce_64.to(dtype)
+    probs_cast = torch.softmax(logits_cast, dim=-1)
+    p_t = probs_cast.gather(1, target_wrong[:, None]).squeeze(1)
+    naive_ce = -torch.log(p_t)
+    fused_ce = F.cross_entropy(logits_cast, target_wrong)
+    naive_finite = bool(torch.isfinite(naive_ce).all())
+    if naive_finite:
+        err = float((naive_ce.double() - ref_naive).abs().max())
+        err_txt = f"{err:.6f}"
+    else:
+        err_txt = "inf/nan"
+    stress_rows.append({
+        "test": "CrossEntropy (naive log(softmax))",
+        "dtype": dtype_name,
+        "max_error": err_txt,
+        "degenerate": "YES" if not naive_finite else "no",
+        "detail": f"naive={float(naive_ce):.3g}, fused={float(fused_ce):.6f}",
+    })
+
+df_stress = pd.DataFrame(stress_rows)
+display(df_stress)
+
+# Summary bar plot
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+tests = ["Softmax (large close logits)", "LayerNorm (var≈0)", "CrossEntropy (naive log(softmax))"]
+for ax, test_name in zip(axes, tests):
+    subset = df_stress[df_stress["test"] == test_name].copy()
+    if len(subset) == 0:
+        continue
+    labels_s = subset["dtype"].tolist()
+    raw_errs = []
+    for e in subset["max_error"].tolist():
+        try:
+            raw_errs.append(float(e))
+        except ValueError:
+            raw_errs.append(float("nan"))
+    finite_errs = [v for v in raw_errs if np.isfinite(v)]
+    cap = max(finite_errs + [1e-8]) * 1.5
+    errs = [v if np.isfinite(v) else cap for v in raw_errs]
+    colors_s = ["#e74c3c" if "FP16" in l else "#3498db" if "BF16" in l else "#2ecc71" for l in labels_s]
+    ax.bar(range(len(labels_s)), errs, color=colors_s, alpha=0.8, edgecolor="white")
+    ax.set_xticks(range(len(labels_s)))
+    ax.set_xticklabels(labels_s, fontsize=9)
+    ax.set_title(test_name, fontsize=10)
+    ax.set_ylabel("Max absolute error")
+    ax.set_ylim(0, cap * 1.2)
+    # Mark degenerate
+    for i, (_, row) in enumerate(subset.iterrows()):
+        if row["degenerate"] == "YES":
+            ax.annotate("FAILS", (i, errs[i]),
+                        ha="center", va="bottom", fontsize=8, color="red", fontweight="bold")
+
+fig.suptitle("Stress tests: adversarial inputs reveal concrete FP16 failure modes", fontsize=12, y=1.02)
+plt.tight_layout()
+
+print("\nKey findings:")
+print("  - Softmax: low precision can erase tiny logit differences at large magnitude, collapsing rank information.")
+print("  - LayerNorm: low precision can collapse near-zero-variance inputs, distorting normalized outputs.")
+print("  - Naive CE: -log(softmax(.)) in low precision can hit log(0); fused F.cross_entropy is much more stable.")
+print("  - These are precisely why AMP favors FP32 for sensitive reductions/log-space operations.")
+""")
+
+
 # ── 3.3 Dtype flow through a transformer ────────────────────────────────────
 
 md(r"""
@@ -3552,6 +3986,101 @@ The promotion at residual connections is a key feature: it prevents precision lo
 > **Note on BatchNorm (for CNN practitioners):** While our transformer example uses LayerNorm, convolutional architectures typically use **BatchNorm**, which maintains running statistics (`running_mean`, `running_var`) that are updated with an exponential moving average across batches. These running statistics must stay in **FP32** — they are long-lived accumulators that would drift significantly in FP16/BF16. PyTorch's autocast handles this automatically (BatchNorm is on the FP32 "keep" list), but if you manually cast your model with `.half()` or `.bfloat16()`, the running statistics will also be cast to low precision, potentially corrupting them over many batches. If you must manually cast, keep normalization layers in FP32: `model.half(); for m in model.modules(): if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)): m.float()`.
 """)
 
+code(r"""
+# Autocast boundary flow diagram: visualize dtype transitions per module
+#
+# Convert the trace records from the 4-config experiment into a horizontal
+# stacked-bar visualization showing input→output dtype for each module.
+
+# Re-run the 4 configs to collect detailed per-module records for visualization.
+
+all_config_records = {}
+for title, param_dt, use_ac in configs:
+    if TRACE_MODEL_KIND == "opt-125m" and trace_hf_model is not None:
+        model_v = trace_hf_model.to(param_dt).eval()
+        hooks_v, rec_v = install_dtype_hooks(model_v)
+        ctx_v = amp_autocast(device, dtype_16, enabled=use_ac)
+        with torch.inference_mode(), ctx_v:
+            _ = model_v(**trace_hf_inputs, use_cache=False)
+    else:
+        model_v = TinyGPT(VOCAB, BLOCK).to(device).to(param_dt)
+        hooks_v, rec_v = install_dtype_hooks(model_v)
+        ctx_v = amp_autocast(device, dtype_16, enabled=use_ac)
+        with torch.inference_mode(), ctx_v:
+            _ = model_v(idx)
+    for h_v in hooks_v:
+        h_v.remove()
+    all_config_records[title] = rec_v
+
+# Build the visualization
+dtype_colors = {
+    "torch.float32": "#3498db",   # blue
+    "torch.float16": "#e74c3c",   # red
+    "torch.bfloat16": "#2ecc71",  # green
+}
+dtype_short = {
+    "torch.float32": "FP32",
+    "torch.float16": "FP16",
+    "torch.bfloat16": "BF16",
+}
+
+n_configs = len(all_config_records)
+max_modules = max((len(records) for records in all_config_records.values()), default=1)
+fig, axes = plt.subplots(1, n_configs, figsize=(5 * n_configs, max(6, 0.22 * max_modules)),
+                          sharey=True)
+if n_configs == 1:
+    axes = [axes]
+
+for ax, (cfg_title, records) in zip(axes, all_config_records.items()):
+    if not records:
+        ax.set_title(cfg_title.split(":")[0], fontsize=9)
+        continue
+    modules = [r["module"] for r in records]
+    in_dtypes = [r["in_dtype"] for r in records]
+    out_dtypes = [r["out_dtype"] for r in records]
+
+    y_pos = np.arange(len(modules))
+
+    # Draw two bars per module: input dtype (left half) and output dtype (right half)
+    in_colors = [dtype_colors.get(d, "#95a5a6") for d in in_dtypes]
+    out_colors = [dtype_colors.get(d, "#95a5a6") for d in out_dtypes]
+
+    ax.barh(y_pos, [0.45] * len(modules), left=0, color=in_colors, alpha=0.8,
+            edgecolor="white", height=0.7, label="input dtype")
+    ax.barh(y_pos, [0.45] * len(modules), left=0.55, color=out_colors, alpha=0.8,
+            edgecolor="white", height=0.7, label="output dtype")
+
+    # Annotate dtype transitions
+    for i, (in_d, out_d) in enumerate(zip(in_dtypes, out_dtypes)):
+        in_label = dtype_short.get(in_d, in_d.replace("torch.", ""))
+        out_label = dtype_short.get(out_d, out_d.replace("torch.", ""))
+        ax.text(0.225, i, in_label, ha="center", va="center", fontsize=6, fontweight="bold", color="white")
+        ax.text(0.775, i, out_label, ha="center", va="center", fontsize=6, fontweight="bold", color="white")
+        # Arrow marker for dtype promotion/demotion
+        if in_d != out_d:
+            ax.annotate("", xy=(0.52, i), xytext=(0.48, i),
+                        arrowprops=dict(arrowstyle="->", color="orange", lw=1.5))
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([m[:30] for m in modules], fontsize=6)
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_xticks([0.225, 0.775])
+    ax.set_xticklabels(["input", "output"], fontsize=8)
+    ax.set_title(cfg_title.split(":")[0] + ":" + cfg_title.split(":", 1)[1][:25], fontsize=8)
+    ax.invert_yaxis()
+
+# Legend
+from matplotlib.patches import Patch
+legend_handles = [Patch(color=c, label=l) for l, c in
+                  [("FP32", "#3498db"), ("FP16", "#e74c3c"), ("BF16", "#2ecc71"), ("Other", "#95a5a6")]]
+fig.legend(handles=legend_handles, loc="lower center", ncol=4, fontsize=8,
+           bbox_to_anchor=(0.5, -0.02))
+fig.suptitle("Autocast dtype flow: input→output per module across 4 configurations",
+             fontsize=12, y=1.02)
+plt.tight_layout()
+print("Orange arrows mark dtype transitions (promotion or demotion) between input and output.")
+""")
+
 
 md(r"""
 ### 3.3.2 Per-layer precision sensitivity: which parts of the transformer hurt most?
@@ -3685,6 +4214,165 @@ if len(rows) > 0:
     ]
     ax.legend(handles=legend_el, loc="lower right", fontsize=8)
     plt.tight_layout()
+""")
+
+
+md(r"""
+### 3.3.3 Per-layer *gradient* sensitivity: which layers contribute most error in the backward pass?
+
+The forward-pass sensitivity above shows output differences. But for training, what matters is whether **gradients** are corrupted. Here we measure: if you force *only one layer* to FP16 (while everything else stays FP32), how much does each layer's gradient contribution change?
+
+This directly answers: *"If I need to keep some layers in FP32 for training stability, which ones?"*
+""")
+
+code(r"""
+# Per-layer gradient sensitivity: force one layer at a time to FP16
+
+import copy
+
+set_seed(0)
+model_ref = TinyGPT(vocab_size=128, block_size=64, n_layer=2, n_embd=128, n_heads=4, dropout=0.0).to(device).float()
+idx_gs = torch.randint(0, 128, (2, 64), device=device)
+
+# Reference: full FP32 forward + backward
+model_ref.zero_grad()
+logits_ref = model_ref(idx_gs)
+loss_ref = F.cross_entropy(logits_ref.reshape(-1, logits_ref.size(-1)),
+                            idx_gs.reshape(-1))  # self-supervised: predict next token approx
+loss_ref.backward()
+ref_grads = {}
+for name, p in model_ref.named_parameters():
+    if p.grad is not None:
+        ref_grads[name] = p.grad.detach().clone().float()
+
+def cast_floating(x, dtype):
+    if isinstance(x, torch.Tensor):
+        return x.to(dtype) if x.is_floating_point() else x
+    if isinstance(x, tuple):
+        return tuple(cast_floating(v, dtype) for v in x)
+    if isinstance(x, list):
+        return [cast_floating(v, dtype) for v in x]
+    return x
+
+# For each named module with parameters, force ONLY that module to FP16
+grad_sensitivity = []
+for mod_name, mod in model_ref.named_modules():
+    params_in_mod = list(mod.parameters(recurse=False))
+    if not params_in_mod:
+        continue
+
+    # Deep copy model, cast only this module to FP16.
+    # Hooks cast module boundaries so the rest of the network stays FP32.
+    model_test = copy.deepcopy(model_ref).float()
+    mod_map = dict(model_test.named_modules())
+    target_mod = mod_map.get(mod_name, None)
+    if target_mod is None:
+        continue
+    target_mod.half()
+
+    h_pre = target_mod.register_forward_pre_hook(
+        lambda module, args: cast_floating(args, torch.float16)
+    )
+    h_post = target_mod.register_forward_hook(
+        lambda module, args, out: cast_floating(out, torch.float32)
+    )
+
+    model_test.zero_grad(set_to_none=True)
+    try:
+        logits_test = model_test(idx_gs)
+        loss_test = F.cross_entropy(logits_test.reshape(-1, logits_test.size(-1)),
+                                     idx_gs.reshape(-1))
+        loss_test.backward()
+    except Exception as exc:
+        grad_sensitivity.append({"module": mod_name, "type": type(mod).__name__,
+                                  "grad_rel_err": float("nan"), "note": str(exc).splitlines()[0]})
+        h_pre.remove()
+        h_post.remove()
+        continue
+    h_pre.remove()
+    h_post.remove()
+
+    # Measure gradient error across ALL parameters (not just this module's)
+    total_err = 0.0
+    total_norm = 0.0
+    for name, p in model_test.named_parameters():
+        if p.grad is not None and name in ref_grads:
+            err = (p.grad.float() - ref_grads[name]).abs().sum().item()
+            norm = ref_grads[name].abs().sum().item() + 1e-12
+            total_err += err
+            total_norm += norm
+
+    grad_sensitivity.append({
+        "module": mod_name if mod_name else "(root)",
+        "type": type(mod).__name__,
+        "grad_rel_err": total_err / total_norm,
+        "note": "",
+    })
+
+# Sort and plot
+df_gs_all = pd.DataFrame(grad_sensitivity)
+df_failed = df_gs_all[df_gs_all["grad_rel_err"].isna()].copy()
+df_gs = df_gs_all.dropna(subset=["grad_rel_err"]).copy()
+df_gs = df_gs[df_gs["grad_rel_err"] > 0].sort_values("grad_rel_err", ascending=False)
+
+if len(df_gs) > 0:
+    fig, ax = plt.subplots(figsize=(14, max(4, len(df_gs) * 0.35)))
+
+    mod_names = df_gs["module"].tolist()
+    mod_types = df_gs["type"].tolist()
+    errs = df_gs["grad_rel_err"].tolist()
+
+    color_map = {
+        "LayerNorm": "#e74c3c",
+        "CausalSelfAttention": "#3498db",
+        "Linear": "#2ecc71",
+    }
+    colors_gs = []
+    for t in mod_types:
+        matched = False
+        for key, col in color_map.items():
+            if key.lower() in t.lower():
+                colors_gs.append(col)
+                matched = True
+                break
+        if not matched:
+            if "attn" in t.lower() or "attention" in t.lower():
+                colors_gs.append("#3498db")
+            elif "mlp" in t.lower() or "sequential" in t.lower():
+                colors_gs.append("#2ecc71")
+            else:
+                colors_gs.append("#95a5a6")
+
+    y_pos = range(len(mod_names))
+    ax.barh(y_pos, errs, color=colors_gs, alpha=0.8, edgecolor="white")
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels([f"{n} ({t})" for n, t in zip(mod_names, mod_types)], fontsize=7)
+    ax.set_xlabel("Relative gradient error (forcing this layer to FP16)")
+    ax.set_title("Per-layer gradient sensitivity: which module hurts training most in FP16?", fontsize=11)
+    ax.set_xscale("log")
+    ax.invert_yaxis()
+
+    from matplotlib.patches import Patch
+    legend_gs = [
+        Patch(color="#e74c3c", label="LayerNorm"),
+        Patch(color="#3498db", label="Attention"),
+        Patch(color="#2ecc71", label="Linear/MLP"),
+        Patch(color="#95a5a6", label="Other"),
+    ]
+    ax.legend(handles=legend_gs, loc="lower right", fontsize=8)
+    plt.tight_layout()
+
+    print("Interpretation:")
+    print("  - Bars are sorted from highest to lowest gradient sensitivity.")
+    print("  - LayerNorm and attention modules typically dominate (reductions + softmax).")
+    print("  - Linear layers are usually safe in FP16 (Tensor Cores accumulate in FP32).")
+    print("  - If you must keep some layers in FP32 for stability, prioritize the top bars.")
+else:
+    print("No gradient sensitivity data collected (need TinyGPT defined above).")
+
+if len(df_failed) > 0:
+    print("\nModules skipped (no valid mixed-precision backward on this device/runtime):")
+    display(df_failed[["module", "type", "note"]])
 """)
 
 
@@ -3877,6 +4565,117 @@ print(f"\nGradients collected: {len(nonzero_grads):,}")
 print(f"Fraction that would underflow in FP16: {fp16_underflow_frac:.4f} ({fp16_underflow_frac*100:.2f}%)")
 print(f"Fraction that would underflow in BF16: {bf16_underflow_frac:.4f} ({bf16_underflow_frac*100:.2f}%)")
 print(f"\nThis is why FP16 needs loss scaling and BF16 usually doesn't.")
+""")
+
+md(r"""
+### 3.4.2b Gradient distribution evolution: how the histogram shifts during training
+
+The Micikevicius snapshot above is from early training. But gradient distributions **shift** as training progresses: early gradients tend to be larger (random initialization → big loss), late gradients tend to be smaller (convergence → tiny updates). This matters because FP16 underflow becomes *worse* as training proceeds.
+
+Here we train TinyGPT for ~200 steps and capture full gradient snapshots at checkpoints, showing:
+1. How the gradient distribution shifts leftward (toward smaller magnitudes) over training.
+2. How loss scaling keeps the distribution within FP16's representable range.
+""")
+
+code(r"""
+# Gradient distribution evolution over training
+
+set_seed(42)
+
+# Use TinyGPT + character data from the training suite
+SNAP_STEPS = [0, 10, 50, 100, 200]
+TOTAL_STEPS = max(SNAP_STEPS) + 1
+BLOCK_EVO = 64
+BATCH_EVO = 32
+
+model_evo = TinyGPT(vocab_size=vocab_size, block_size=BLOCK_EVO, n_layer=2,
+                     n_embd=128, n_heads=4, dropout=0.0).to(device).float()
+opt_evo = torch.optim.Adam(model_evo.parameters(), lr=3e-4)
+
+grad_snapshots = {}
+LOSS_SCALE_DEMO = 1024.0  # fixed scale for illustration
+
+for step in range(TOTAL_STEPS):
+    # Sample batch
+    max_start = train_data.size(0) - BLOCK_EVO - 1
+    ix = torch.randint(0, max_start, (BATCH_EVO,), device=device)
+    offsets = torch.arange(BLOCK_EVO, device=device).unsqueeze(0)
+    xb = train_data[ix.unsqueeze(1) + offsets]
+    yb = train_data[ix.unsqueeze(1) + offsets + 1]
+
+    opt_evo.zero_grad(set_to_none=True)
+    logits_evo = model_evo(xb)
+    loss_evo = F.cross_entropy(logits_evo.reshape(-1, logits_evo.size(-1)), yb.reshape(-1))
+    loss_evo.backward()
+
+    if step in SNAP_STEPS:
+        all_g = torch.cat([p.grad.detach().float().flatten().cpu()
+                           for p in model_evo.parameters() if p.grad is not None])
+        grad_snapshots[step] = all_g
+
+    opt_evo.step()
+
+# Plot: one subplot per snapshot
+n_snaps = len(grad_snapshots)
+fig, axes = plt.subplots(1, n_snaps, figsize=(4 * n_snaps, 5), sharey=True)
+if n_snaps == 1:
+    axes = [axes]
+
+fi16 = torch.finfo(torch.float16)
+min_normal_fp16 = float(fi16.tiny)
+min_sub_fp16 = float(torch.nextafter(torch.tensor(0.0, dtype=torch.float16),
+                                       torch.tensor(1.0, dtype=torch.float16)))
+
+for ax, (step, grads) in zip(axes, sorted(grad_snapshots.items())):
+    nonzero = grads[grads != 0]
+    if len(nonzero) == 0:
+        continue
+    log_abs = torch.log10(nonzero.abs()).numpy()
+
+    # Unscaled distribution
+    ax.hist(log_abs, bins=150, alpha=0.6, color="steelblue", edgecolor="none",
+            density=True, label="Unscaled gradients")
+
+    # Scaled distribution (shifted by log10(scale))
+    log_abs_scaled = log_abs + np.log10(LOSS_SCALE_DEMO)
+    ax.hist(log_abs_scaled, bins=150, alpha=0.4, color="orange", edgecolor="none",
+            density=True, label=f"Scaled (×{LOSS_SCALE_DEMO:.0f})")
+
+    # FP16 range markers
+    ax.axvline(np.log10(min_normal_fp16), color="red", ls="--", lw=1.5, alpha=0.8)
+    ax.axvline(np.log10(min_sub_fp16), color="darkred", ls=":", lw=1, alpha=0.6)
+    ax.axvspan(ax.get_xlim()[0] if ax.get_xlim()[0] < np.log10(min_sub_fp16) else -20,
+               np.log10(min_sub_fp16), alpha=0.1, color="red")
+
+    # Fractions below FP16 thresholds
+    below_normal = float((nonzero.abs() < min_normal_fp16).float().mean())
+    true_underflow = float((nonzero.abs() < min_sub_fp16).float().mean())
+    ax.set_title(
+        f"Step {step}\n(<min normal: {below_normal*100:.1f}%, <min sub: {true_underflow*100:.2f}%)",
+        fontsize=9,
+    )
+    ax.set_xlabel("log₁₀(|grad|)", fontsize=8)
+    if ax == axes[0]:
+        ax.set_ylabel("density", fontsize=8)
+
+axes[0].legend(fontsize=7, loc="upper left")
+
+fig.suptitle("Gradient distribution evolution: how gradients shift during training\n"
+             f"(red dashed = FP16 min normal, dark-red dotted = min subnormal)",
+             fontsize=11, y=1.05)
+plt.tight_layout()
+
+# Summary stats
+print(f"\nGradient evolution summary (FP16 thresholds):")
+for step, grads in sorted(grad_snapshots.items()):
+    nonzero = grads[grads != 0]
+    frac_below_normal = float((nonzero.abs() < min_normal_fp16).float().mean()) * 100
+    frac_true_underflow = float((nonzero.abs() < min_sub_fp16).float().mean()) * 100
+    print(f"  Step {step:>3d}: {frac_below_normal:.2f}% < min normal, {frac_true_underflow:.4f}% < min subnormal")
+print(f"\nTakeaway: As training converges, more gradients move into FP16's low-magnitude region.")
+print(f"Loss scaling (orange) shifts the distribution right, keeping gradients representable.")
+
+del model_evo, opt_evo
 """)
 
 md(r"""
@@ -4890,6 +5689,229 @@ for r in results:
 
 if printed == 0:
     print("No successful runs to sample from.")
+""")
+
+
+# ── 3.6.2 OPT-125M training loss curves ─────────────────────────────────────
+
+md(r"""
+### 3.6.2 OPT-125M training loss curves: real-world AMP on a Hugging Face model
+
+TinyGPT above demonstrates AMP mechanics at small scale. Now we repeat the experiment with **OPT-125M** (125M parameters) — a real pretrained transformer — to show that the same patterns hold at realistic scale.
+
+We fine-tune for **60 steps** under 6 precision configurations:
+
+| # | Name | Params | Autocast | Scaler | Expected |
+|---|------|--------|----------|--------|----------|
+| 1 | `no_ac_fp32` | FP32 | OFF | No | Stable baseline |
+| 2 | `no_ac_fp16` | FP16 | OFF | No | Often unstable / may diverge |
+| 3 | `no_ac_bf16` | BF16 | OFF | No | May work (wider range) |
+| 4 | `ac_fp32` | FP32 | ON | Yes | Canonical AMP baseline |
+| 5 | `ac_fp16` | FP16 | ON | Yes | Non-standard; may improve vs naive FP16 |
+| 6 | `ac_bf16` | BF16 | ON | No | Usually stable where BF16 is supported |
+
+> **Guard:** This section requires `trace_hf_model` (OPT-125M) loaded earlier + CUDA. Skipped otherwise.
+""")
+
+code(r"""
+# OPT-125M training setup
+
+opt_train_results = []
+
+if trace_hf_model is None or device.type != "cuda":
+    print("Skipping OPT-125M training: requires trace_hf_model (OPT-125M) + CUDA.")
+    print("To enable: set ALLOW_OPT_DOWNLOAD=True and run on a CUDA device.")
+else:
+    import copy as _copy
+
+    # Tokenize a corpus with the OPT BPE tokenizer
+    opt_corpus_text = corpus[:20000]  # reuse the char-level corpus text
+    opt_tokens = trace_hf_tokenizer(opt_corpus_text, return_tensors="pt",
+                                     truncation=True, max_length=4096)["input_ids"].squeeze(0).to(device)
+    n_opt = int(0.9 * len(opt_tokens))
+    opt_train_tokens = opt_tokens[:n_opt]
+    opt_val_tokens = opt_tokens[n_opt:]
+
+    OPT_BLOCK = 128
+    OPT_BATCH = 4
+    OPT_STEPS = 60
+    OPT_LR = 5e-5
+
+    def get_opt_batch(split):
+        src = opt_train_tokens if split == "train" else opt_val_tokens
+        max_start = src.size(0) - OPT_BLOCK - 1
+        if max_start <= 0:
+            max_start = 1
+        ix = torch.randint(0, max_start, (OPT_BATCH,), device=device)
+        offsets = torch.arange(OPT_BLOCK, device=device).unsqueeze(0)
+        x = src[ix.unsqueeze(1) + offsets]
+        y = src[ix.unsqueeze(1) + offsets + 1]
+        return x, y
+
+    print(f"OPT-125M tokens: train={len(opt_train_tokens):,}, val={len(opt_val_tokens):,}")
+    print(f"Training: {OPT_STEPS} steps, batch={OPT_BATCH}, block={OPT_BLOCK}, lr={OPT_LR}")
+""")
+
+code(r"""
+# OPT-125M training loop
+
+if trace_hf_model is not None and device.type == "cuda":
+    import copy as _copy
+
+    opt_configs = [
+        {"name": "no_ac_fp32",  "param_dtype": torch.float32,  "use_autocast": False, "ac_dtype": None,           "use_scaler": False},
+        {"name": "no_ac_fp16",  "param_dtype": torch.float16,  "use_autocast": False, "ac_dtype": None,           "use_scaler": False},
+        {"name": "no_ac_bf16",  "param_dtype": torch.bfloat16, "use_autocast": False, "ac_dtype": None,           "use_scaler": False},
+        {"name": "ac_fp32",     "param_dtype": torch.float32,  "use_autocast": True,  "ac_dtype": torch.float16,  "use_scaler": True},
+        {"name": "ac_fp16",     "param_dtype": torch.float16,  "use_autocast": True,  "ac_dtype": torch.float16,  "use_scaler": True},
+        {"name": "ac_bf16",     "param_dtype": torch.bfloat16, "use_autocast": True,  "ac_dtype": torch.bfloat16, "use_scaler": False},
+    ]
+
+    # Check BF16 support
+    if not torch.cuda.is_bf16_supported():
+        opt_configs = [c for c in opt_configs if c["param_dtype"] != torch.bfloat16]
+
+    def train_opt(cfg):
+        set_seed(42)
+        torch.cuda.empty_cache()
+
+        model_t = _copy.deepcopy(trace_hf_model).to(cfg["param_dtype"]).train()
+        opt_t = torch.optim.AdamW(model_t.parameters(), lr=OPT_LR, weight_decay=0.01)
+        scaler = GradScaler(device="cuda") if cfg["use_scaler"] else None
+
+        losses, grad_norms, zero_fracs = [], [], []
+        status = "ok"
+
+        for step in range(OPT_STEPS):
+            xb, yb = get_opt_batch("train")
+            opt_t.zero_grad(set_to_none=True)
+
+            ctx = amp_autocast(device, cfg["ac_dtype"], enabled=cfg["use_autocast"]) if cfg["use_autocast"] else nullcontext()
+            with ctx:
+                out = model_t(xb, labels=yb)
+                loss = out.loss
+
+            if not torch.isfinite(loss):
+                status = f"diverged@step{step}"
+                losses.append(float("nan"))
+                break
+
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt_t)
+                gn = torch.nn.utils.clip_grad_norm_(model_t.parameters(), 1.0)
+                scaler.step(opt_t)
+                scaler.update()
+            else:
+                loss.backward()
+                gn = torch.nn.utils.clip_grad_norm_(model_t.parameters(), 1.0)
+                opt_t.step()
+
+            losses.append(float(loss))
+            grad_norms.append(float(gn) if torch.isfinite(gn) else float("nan"))
+
+            # Zero gradient fraction
+            zf = 0.0
+            total_params = 0
+            for p in model_t.parameters():
+                if p.grad is not None:
+                    g = p.grad.float().flatten()
+                    zf += float((g == 0).sum())
+                    total_params += g.numel()
+            zero_fracs.append(zf / max(total_params, 1))
+
+        del model_t, opt_t
+        if scaler is not None:
+            del scaler
+        torch.cuda.empty_cache()
+
+        return {"name": cfg["name"], "status": status, "losses": losses,
+                "grad_norms": grad_norms, "zero_fracs": zero_fracs}
+
+    for cfg in tqdm(opt_configs, desc="OPT-125M configs"):
+        print(f"\n--- {cfg['name']} ---")
+        result = train_opt(cfg)
+        opt_train_results.append(result)
+        print(f"  Status: {result['status']}, "
+              f"Final loss: {result['losses'][-1]:.4f}" if result['losses'] and not np.isnan(result['losses'][-1]) else f"  Status: {result['status']}")
+""")
+
+code(r"""
+# OPT-125M: plot loss curves + gradient norms + final loss comparison
+
+if len(opt_train_results) > 0:
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+
+    # Color/style mapping
+    color_map_opt = {
+        "no_ac_fp32": ("#2ecc71", "-"),   "no_ac_fp16": ("#e74c3c", "--"),
+        "no_ac_bf16": ("#3498db", "--"),   "ac_fp32": ("#27ae60", "-"),
+        "ac_fp16": ("#c0392b", "-"),       "ac_bf16": ("#2980b9", "-"),
+    }
+
+    # Left: loss curves
+    ax = axes[0]
+    for r in opt_train_results:
+        color, ls = color_map_opt.get(r["name"], ("#95a5a6", "-"))
+        label = r["name"]
+        if r["status"] != "ok":
+            label += f" ({r['status']})"
+        ax.plot(r["losses"], color=color, ls=ls, lw=1.5, alpha=0.8, label=label)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    ax.set_title("OPT-125M: Training Loss Curves", fontsize=10)
+    ax.legend(fontsize=7)
+    ax.set_ylim(bottom=0)
+
+    # Middle: gradient norms
+    ax = axes[1]
+    for r in opt_train_results:
+        if not r["grad_norms"]:
+            continue
+        color, ls = color_map_opt.get(r["name"], ("#95a5a6", "-"))
+        ax.plot(r["grad_norms"], color=color, ls=ls, lw=1.2, alpha=0.7, label=r["name"])
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Gradient Norm")
+    ax.set_title("Gradient Norm Over Training", fontsize=10)
+    ax.set_yscale("log")
+    ax.legend(fontsize=7)
+
+    # Right: final loss bar chart
+    ax = axes[2]
+    ok_results = [r for r in opt_train_results if r["losses"] and not np.isnan(r["losses"][-1])]
+    if ok_results:
+        names = [r["name"] for r in ok_results]
+        final_losses = [r["losses"][-1] for r in ok_results]
+        bar_colors = [color_map_opt.get(n, ("#95a5a6", "-"))[0] for n in names]
+        ax.bar(range(len(names)), final_losses, color=bar_colors, alpha=0.8, edgecolor="white")
+        ax.set_xticks(range(len(names)))
+        ax.set_xticklabels(names, fontsize=7, rotation=30, ha="right")
+        ax.set_ylabel("Final Loss")
+        ax.set_title("Final Loss Comparison", fontsize=10)
+
+        # Mark diverged
+        for r in opt_train_results:
+            if r["status"] != "ok" and r["name"] not in names:
+                ax.annotate(f"{r['name']}\n(DIVERGED)", xy=(0.98, 0.95),
+                            xycoords="axes fraction", ha="right", va="top",
+                            fontsize=7, color="red")
+
+    fig.suptitle("OPT-125M fine-tuning: 6 precision configurations × 60 steps", fontsize=12, y=1.02)
+    plt.tight_layout()
+else:
+    print("No OPT-125M training results (skipped: need OPT-125M + CUDA).")
+""")
+
+md(r"""
+**Observation (OPT-125M Training):**
+- **`no_ac_fp32`** (FP32 baseline): stable, converging loss — the reference.
+- **`no_ac_fp16`** (naive FP16): often unstable (divergence, NaNs, or noisy optimization), but exact behavior depends on GPU, LR, and clipping.
+- **`no_ac_bf16`** (naive BF16): usually more stable than FP16 (wider exponent range), sometimes with a small quality tradeoff.
+- **`ac_fp32`** (FP32 params + autocast FP16): canonical AMP setup; usually best stability/speed tradeoff.
+- **`ac_fp16`** (FP16 params + autocast): can improve over naive FP16, but remains less robust than FP32-master AMP because params/optimizer states stay low precision.
+- **`ac_bf16`** (BF16 params + autocast): typically stable without a scaler on BF16-capable hardware.
+
+Use this section as an empirical benchmark: the plotted outcomes are authoritative for your run, and the qualitative trend to look for is that **policy-driven mixed precision is safer than naive global casting**.
 """)
 
 
