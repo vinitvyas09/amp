@@ -3313,10 +3313,14 @@ code(r"""
 set_seed(0)
 B, N_HEADS, SEQ, HEAD_DIM = 4, 4, 64, 32
 
-# Create random Q, K, V (scaled up by 5x to stress precision)
-q64 = torch.randn(B, N_HEADS, SEQ, HEAD_DIM, device=device, dtype=torch.float64) * 5
-k64 = q64.clone()  # K = Q → large diagonal in Q·K^T, stressing softmax with peaked logits
-v64 = torch.randn(B, N_HEADS, SEQ, HEAD_DIM, device=device, dtype=torch.float64) * 5
+# Build correlated Q/K that are challenging for precision but not fully saturated.
+# Fully tying K=Q with large magnitudes makes attention nearly one-hot and can hide
+# meaningful differences in output/entropy metrics.
+base_q = F.normalize(torch.randn(B, N_HEADS, SEQ, HEAD_DIM, device=device, dtype=torch.float64), dim=-1)
+base_k = F.normalize(base_q + 0.35 * torch.randn(B, N_HEADS, SEQ, HEAD_DIM, device=device, dtype=torch.float64), dim=-1)
+q64 = base_q * 8.0
+k64 = base_k * 8.0
+v64 = torch.randn(B, N_HEADS, SEQ, HEAD_DIM, device=device, dtype=torch.float64) * 2.0
 
 def attention_forward(q, k, v):
     scale = math.sqrt(q.size(-1))
@@ -3327,6 +3331,7 @@ def attention_forward(q, k, v):
 
 # FP64 reference
 w64, o64 = attention_forward(q64, k64, v64)
+entropy_ref = float(-(w64 * (w64 + 1e-12).log()).sum(-1).mean())
 
 attn_rows = []
 attn_skipped = []
@@ -3352,16 +3357,28 @@ for dtype_name, dtype in [("FP32", torch.float32), ("FP16", torch.float16), ("BF
             continue
         # Errors vs FP64
         w_err = float((w_test.double() - w64).abs().max())
+        out_rel_l2 = float((o_test.double() - o64).norm() / (o64.norm() + 1e-12))
         cos = float(F.cosine_similarity(o_test.double().flatten().unsqueeze(0),
-                                         o64.flatten().unsqueeze(0)))
+                                        o64.flatten().unsqueeze(0)))
         entropy = float(-(w_test.double() * (w_test.double() + 1e-12).log()).sum(-1).mean())
+        entropy_err = abs(entropy - entropy_ref)
         attn_rows.append({
             "dtype": dtype_name, "mode": ac_label,
-            "max_weight_err": w_err, "output_cos_sim": cos, "attn_entropy": entropy,
+            "max_weight_err": w_err,
+            "output_rel_l2": out_rel_l2,
+            "output_cos_sim": cos,
+            "attn_entropy": entropy,
+            "attn_entropy_err": entropy_err,
         })
 
 df_attn = pd.DataFrame(attn_rows)
-display(df_attn)
+if len(df_attn) > 0:
+    display(df_attn[[
+        "dtype", "mode", "max_weight_err", "output_rel_l2",
+        "output_cos_sim", "attn_entropy", "attn_entropy_err"
+    ]])
+else:
+    display(df_attn)
 if attn_skipped:
     print("Skipped attention configs (unsupported dtype/backend path):")
     display(pd.DataFrame(attn_skipped))
@@ -3373,15 +3390,18 @@ if len(df_attn) > 0:
     x = np.arange(len(labels))
     colors = ["#e74c3c" if "FP16" in l else "#3498db" if "BF16" in l else "#2ecc71" for l in labels]
 
-    for ax, metric, title in zip(axes, ["max_weight_err", "output_cos_sim", "attn_entropy"],
-                                  ["Max Attention Weight Error", "Output Cosine Similarity (vs FP64)", "Attention Entropy"]):
-        vals = df_attn[metric].tolist()
+    for ax, metric, title in zip(
+        axes,
+        ["max_weight_err", "output_rel_l2", "attn_entropy_err"],
+        ["Max Attention Weight Error", "Output Relative L2 Error (vs FP64)", "Attention Entropy Error (|H-H_ref|)"]
+    ):
+        vals = np.array(df_attn[metric].tolist(), dtype=np.float64)
+        vals = np.maximum(vals, 1e-20)
         bars = ax.bar(x, vals, color=colors, alpha=0.8, edgecolor="white")
         ax.set_xticks(x)
         ax.set_xticklabels(labels, fontsize=7, rotation=30, ha="right")
         ax.set_title(title, fontsize=10)
-        if metric == "max_weight_err":
-            ax.set_yscale("log")
+        ax.set_yscale("log")
 
     fig.suptitle("Attention: precision effects on Q·K^T → softmax → @V", fontsize=12, y=1.02)
     plt.tight_layout()
@@ -3389,9 +3409,9 @@ if len(df_attn) > 0:
 
 md(r"""
 **Observation (Attention):**
-- FP16 without autocast shows the **largest attention weight errors** — `exp()` in softmax amplifies small rounding differences into large distribution shifts.
-- On many CUDA AMP policies, autocast routes softmax/reductions to FP32 while keeping matmuls in 16-bit, giving near-FP32-quality attention weights (verify with your local traces in Sections 3.2/3.3).
-- BF16's wider exponent range means it rarely overflows in softmax, but its lower mantissa precision still shows higher error than FP32.
+- With a correlated (but non-saturated) Q/K setup, low-precision no-autocast runs show larger **weight/output/entropy errors** than FP32.
+- On many CUDA AMP policies, autocast routes softmax/reductions to FP32 while keeping matmuls in 16-bit, so attention errors often drop substantially.
+- BF16's wider exponent range helps avoid extreme overflow behavior, but its 7-bit mantissa can still leave larger residual error than FP32.
 """)
 
 code(r"""
@@ -5787,7 +5807,7 @@ We fine-tune for **60 steps** under 6 precision configurations:
 | 2 | `no_ac_fp16` | FP16 | OFF | No | Often unstable / may diverge |
 | 3 | `no_ac_bf16` | BF16 | OFF | No | May work (wider range) |
 | 4 | `ac_fp32` | FP32 | ON | Yes | Canonical AMP baseline |
-| 5 | `ac_fp16` | FP16 | ON | Yes | Non-standard; may improve vs naive FP16 |
+| 5 | `ac_fp16` | FP16 | ON | No | Non-standard; may improve vs naive FP16 |
 | 6 | `ac_bf16` | BF16 | ON | No | Usually stable where BF16 is supported |
 
 These 6 runs intentionally vary **both** parameter dtype and autocast policy to show practical regimes you will encounter in real code, not just a single-axis ablation.
@@ -5845,7 +5865,7 @@ if trace_hf_model is not None and device.type == "cuda":
         {"name": "no_ac_fp16",  "param_dtype": torch.float16,  "use_autocast": False, "ac_dtype": None,           "use_scaler": False},
         {"name": "no_ac_bf16",  "param_dtype": torch.bfloat16, "use_autocast": False, "ac_dtype": None,           "use_scaler": False},
         {"name": "ac_fp32",     "param_dtype": torch.float32,  "use_autocast": True,  "ac_dtype": torch.float16,  "use_scaler": True},
-        {"name": "ac_fp16",     "param_dtype": torch.float16,  "use_autocast": True,  "ac_dtype": torch.float16,  "use_scaler": True},
+        {"name": "ac_fp16",     "param_dtype": torch.float16,  "use_autocast": True,  "ac_dtype": torch.float16,  "use_scaler": False},
         {"name": "ac_bf16",     "param_dtype": torch.bfloat16, "use_autocast": True,  "ac_dtype": torch.bfloat16, "use_scaler": False},
     ]
 
@@ -5859,7 +5879,14 @@ if trace_hf_model is not None and device.type == "cuda":
 
         model_t = _copy.deepcopy(trace_hf_model).to(cfg["param_dtype"]).train()
         opt_t = torch.optim.AdamW(model_t.parameters(), lr=OPT_LR, weight_decay=0.01)
-        scaler = GradScaler(enabled=True) if cfg["use_scaler"] else None
+        # GradScaler is valid for FP16 autocast with FP32 parameters.
+        # It cannot unscale optimizer-owned FP16 gradients.
+        use_scaler = (
+            cfg["use_scaler"]
+            and cfg["param_dtype"] == torch.float32
+            and cfg["ac_dtype"] == torch.float16
+        )
+        scaler = GradScaler(enabled=True) if use_scaler else None
 
         losses, grad_norms, zero_fracs = [], [], []
         status = "ok"
