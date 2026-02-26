@@ -3315,7 +3315,7 @@ B, N_HEADS, SEQ, HEAD_DIM = 4, 4, 64, 32
 
 # Create random Q, K, V (scaled up by 5x to stress precision)
 q64 = torch.randn(B, N_HEADS, SEQ, HEAD_DIM, device=device, dtype=torch.float64) * 5
-k64 = q64.clone()
+k64 = q64.clone()  # K = Q → large diagonal in Q·K^T, stressing softmax with peaked logits
 v64 = torch.randn(B, N_HEADS, SEQ, HEAD_DIM, device=device, dtype=torch.float64) * 5
 
 def attention_forward(q, k, v):
@@ -4148,7 +4148,7 @@ for ax, (cfg_title, records) in zip(axes, all_config_records.items()):
     ax.set_xlim(-0.05, 1.05)
     ax.set_xticks([0.225, 0.775])
     ax.set_xticklabels(["input", "output"], fontsize=8)
-    ax.set_title(cfg_title.split(":")[0] + ":" + cfg_title.split(":", 1)[1][:25], fontsize=8)
+    ax.set_title(cfg_title.split(":")[0] + ":" + cfg_title.split(":", 1)[1][:40], fontsize=8)
     ax.invert_yaxis()
 
 # Legend
@@ -4659,13 +4659,16 @@ code(r"""
 
 set_seed(42)
 
-# Use TinyGPT + character data from the training suite
+# Self-contained mini-corpus (avoids dependency on Section 3.6 data)
 SNAP_STEPS = [0, 10, 50, 100, 200]
 TOTAL_STEPS = max(SNAP_STEPS) + 1
 BLOCK_EVO = 64
 BATCH_EVO = 32
+VOCAB_EVO = 128
 
-model_evo = TinyGPT(vocab_size=vocab_size, block_size=BLOCK_EVO, n_layer=2,
+train_data_evo = torch.randint(0, VOCAB_EVO, (BLOCK_EVO * BATCH_EVO * 10,), device=device)
+
+model_evo = TinyGPT(vocab_size=VOCAB_EVO, block_size=BLOCK_EVO, n_layer=2,
                      n_embd=128, n_heads=4, dropout=0.0).to(device).float()
 opt_evo = torch.optim.Adam(model_evo.parameters(), lr=3e-4)
 
@@ -4673,12 +4676,12 @@ grad_snapshots = {}
 LOSS_SCALE_DEMO = 1024.0  # fixed scale for illustration
 
 for step in range(TOTAL_STEPS):
-    # Sample batch
-    max_start = train_data.size(0) - BLOCK_EVO - 1
+    # Sample batch from self-contained mini-corpus
+    max_start = train_data_evo.size(0) - BLOCK_EVO - 1
     ix = torch.randint(0, max_start, (BATCH_EVO,), device=device)
     offsets = torch.arange(BLOCK_EVO, device=device).unsqueeze(0)
-    xb = train_data[ix.unsqueeze(1) + offsets]
-    yb = train_data[ix.unsqueeze(1) + offsets + 1]
+    xb = train_data_evo[ix.unsqueeze(1) + offsets]
+    yb = train_data_evo[ix.unsqueeze(1) + offsets + 1]
 
     opt_evo.zero_grad(set_to_none=True)
     logits_evo = model_evo(xb)
@@ -4752,7 +4755,7 @@ for step, grads in sorted(grad_snapshots.items()):
 print(f"\nTakeaway: As training converges, more gradients move into FP16's low-magnitude region.")
 print(f"The orange overlay is a fixed-scale what-if (not dynamic GradScaler), showing why scaling helps.")
 
-del model_evo, opt_evo
+del model_evo, opt_evo, train_data_evo
 """)
 
 md(r"""
@@ -5919,7 +5922,7 @@ code(r"""
 # OPT-125M: plot loss curves + gradient norms + final loss comparison
 
 if len(opt_train_results) > 0:
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
 
     # Color/style mapping
     color_map_opt = {
@@ -5928,8 +5931,8 @@ if len(opt_train_results) > 0:
         "ac_fp16": ("#c0392b", "-"),       "ac_bf16": ("#2980b9", "-"),
     }
 
-    # Left: loss curves
-    ax = axes[0]
+    # Top-left: loss curves
+    ax = axes[0, 0]
     for r in opt_train_results:
         color, ls = color_map_opt.get(r["name"], ("#95a5a6", "-"))
         label = r["name"]
@@ -5942,8 +5945,8 @@ if len(opt_train_results) > 0:
     ax.legend(fontsize=7)
     ax.set_ylim(bottom=0)
 
-    # Middle: gradient norms
-    ax = axes[1]
+    # Top-right: gradient norms
+    ax = axes[0, 1]
     for r in opt_train_results:
         if not r["grad_norms"]:
             continue
@@ -5955,8 +5958,8 @@ if len(opt_train_results) > 0:
     ax.set_yscale("log")
     ax.legend(fontsize=7)
 
-    # Right: final loss bar chart
-    ax = axes[2]
+    # Bottom-left: final loss bar chart
+    ax = axes[1, 0]
     ok_results = [r for r in opt_train_results if r["losses"] and not np.isnan(r["losses"][-1])]
     if ok_results:
         names = [r["name"] for r in ok_results]
@@ -5968,12 +5971,24 @@ if len(opt_train_results) > 0:
         ax.set_ylabel("Final Loss")
         ax.set_title("Final Loss Comparison", fontsize=10)
 
-        # Mark diverged
-        for r in opt_train_results:
-            if r["status"] != "ok" and r["name"] not in names:
-                ax.annotate(f"{r['name']}\n(DIVERGED)", xy=(0.98, 0.95),
-                            xycoords="axes fraction", ha="right", va="top",
-                            fontsize=7, color="red")
+        # Mark diverged (offset vertically to avoid overlap)
+        diverged = [r for r in opt_train_results if r["status"] != "ok" and r["name"] not in names]
+        for i, r in enumerate(diverged):
+            ax.annotate(f"{r['name']} ({r['status']})", xy=(0.98, 0.95 - 0.08 * i),
+                        xycoords="axes fraction", ha="right", va="top",
+                        fontsize=7, color="red")
+
+    # Bottom-right: zero-gradient fraction
+    ax = axes[1, 1]
+    for r in opt_train_results:
+        if not r["zero_fracs"]:
+            continue
+        color, ls = color_map_opt.get(r["name"], ("#95a5a6", "-"))
+        ax.plot(r["zero_fracs"], color=color, ls=ls, lw=1.2, alpha=0.7, label=r["name"])
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Zero-Gradient Fraction")
+    ax.set_title("Zero-Gradient Fraction (FP16 underflow indicator)", fontsize=10)
+    ax.legend(fontsize=7)
 
     fig.suptitle("OPT-125M fine-tuning: 6 precision configurations × 60 steps", fontsize=12, y=1.02)
     plt.tight_layout()
