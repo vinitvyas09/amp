@@ -3071,18 +3071,19 @@ code(r"""
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
 configs = [
-    ("FP32 baseline", log_fp32, "C0"),
-    ("Naive FP16", log_fp16_naive, "C3"),
-    ("Naive BF16", log_bf16_naive, "C5"),
-    ("FP16 + master wts", log_master, "C1"),
-    ("FP16 + master + scaling", log_scaled, "C4"),
-    (f"PyTorch AMP ({log_amp['dtype']})", log_amp, "C2"),
+    ("Naive FP16", log_fp16_naive, "C3", {}),
+    ("Naive BF16", log_bf16_naive, "C5", {}),
+    ("FP16 + master wts", log_master, "C1", {}),
+    ("FP16 + master + scaling", log_scaled, "C4", {}),
+    (f"PyTorch AMP ({log_amp['dtype']})", log_amp, "C2", {}),
+    # FP32 baseline last so it draws on top; dashed for visibility
+    ("FP32 baseline", log_fp32, "C0", {"linestyle": "--", "linewidth": 2, "zorder": 10}),
 ]
 
 # Loss curves
-for name, log, color in configs:
+for name, log, color, kw in configs:
     if log["loss"]:
-        axes[0].plot(log["loss"], label=name, color=color, alpha=0.8)
+        axes[0].plot(log["loss"], label=name, color=color, alpha=0.8, **kw)
 axes[0].set_title("Training loss")
 axes[0].set_xlabel("step")
 axes[0].set_ylabel("MSE loss")
@@ -3090,18 +3091,18 @@ axes[0].set_yscale("log")
 axes[0].legend(fontsize=7)
 
 # Zero gradient fraction
-for name, log, color in configs:
+for name, log, color, kw in configs:
     if log["zero_grad_frac"]:
-        axes[1].plot(log["zero_grad_frac"], label=name, color=color, alpha=0.8)
+        axes[1].plot(log["zero_grad_frac"], label=name, color=color, alpha=0.8, **kw)
 axes[1].set_title("Fraction of zero gradients")
 axes[1].set_xlabel("step")
 axes[1].set_ylabel("fraction")
 axes[1].legend(fontsize=7)
 
 # Median gradient magnitude
-for name, log, color in configs:
+for name, log, color, kw in configs:
     if log["median_grad"]:
-        axes[2].plot(log["median_grad"], label=name, color=color, alpha=0.8)
+        axes[2].plot(log["median_grad"], label=name, color=color, alpha=0.8, **kw)
 axes[2].set_title("Median |gradient|")
 axes[2].set_xlabel("step")
 axes[2].set_ylabel("|grad|")
