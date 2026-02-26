@@ -161,10 +161,16 @@ You need:
 - Python 3.10+
 - PyTorch 2.x
 - `matplotlib`, `numpy`, `pandas`, `tqdm`
+- (optional) `transformers` + `safetensors` (only for the OPT-125M dtype-tracing section)
 
 ### Install (CPU-only quick start)
 ```bash
 pip install torch numpy pandas matplotlib tqdm
+```
+
+### Optional (to run the OPT-125M dtype-tracing section)
+```bash
+pip install transformers safetensors
 ```
 
 ### Install (CUDA)
@@ -3283,7 +3289,11 @@ else:
 md(r"""
 ## 3.3 Watch dtype flow through a transformer (4 configurations)
 
-This is the "visceral" version of the operator policy: instead of probing individual ops, we observe dtypes flowing through a real transformer model.
+This is the "visceral" version of the operator policy: instead of probing individual ops, we observe dtypes flowing through a transformer forward pass.
+
+**Practical model:** if you have `transformers` installed, we'll trace dtypes through the Hugging Face `facebook/opt-125m` model (OPT-125M). Otherwise we fall back to a tiny self-contained transformer (`TinyGPT`) that still exercises the same building blocks (embeddings, LayerNorm, linear projections, residuals).
+
+The next cell can download OPT-125M once and cache it in a local directory (so the rest of the notebook doesn't depend on your global Hugging Face cache). Set `ALLOW_OPT_DOWNLOAD = False` to run the trace only if the weights/tokenizer are already cached locally.
 
 We'll test all four combinations from the toy example (source1):
 
@@ -3296,7 +3306,7 @@ We'll test all four combinations from the toy example (source1):
 """)
 
 code(r"""
-# Tiny transformer model for dtype tracing
+# Self-contained tiny transformer (TinyGPT) used later (and as a dtype-tracing fallback).
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, n_embd, n_heads, dropout=0.0):
@@ -3366,7 +3376,64 @@ class TinyGPT(nn.Module):
         x = self.ln_f(x)
         return self.head(x)
 
-print("TinyGPT defined: 2-layer transformer for dtype tracing and training experiments.")
+print("TinyGPT defined: self-contained transformer for later experiments (and as a dtype-tracing fallback).")
+""")
+
+code(r"""
+# Pick a model for dtype tracing: OPT-125M if available, else TinyGPT.
+#
+# Why the indirection?
+# - OPT-125M makes the trace look like real-world transformer code (Hugging Face module names).
+# - But it adds optional deps and (unless cached) a ~500MB download, so we keep a no-download fallback.
+
+TRACE_MODEL_KIND = "tinygpt"  # "opt-125m" if successfully loaded
+TRACE_OPT_MODEL_NAME = "facebook/opt-125m"
+
+# Download/caching controls (keep all "extra dependencies" and downloads in this one cell).
+ALLOW_OPT_DOWNLOAD = True
+from pathlib import Path
+HF_CACHE_DIR = Path("./.cache/hf").resolve()
+HF_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+trace_hf_model = None
+trace_hf_inputs = None
+trace_hf_tokenizer = None
+
+if device.type == "cuda":
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+    except Exception as e:
+        print(f"[info] transformers not available ({e}); using TinyGPT for dtype tracing.")
+    else:
+        try:
+            hf_kwargs = {"cache_dir": str(HF_CACHE_DIR), "local_files_only": not ALLOW_OPT_DOWNLOAD}
+            print(f"[info] OPT cache_dir: {HF_CACHE_DIR}")
+            trace_hf_tokenizer = AutoTokenizer.from_pretrained(TRACE_OPT_MODEL_NAME, use_fast=True, **hf_kwargs)
+            trace_hf_model = AutoModelForCausalLM.from_pretrained(
+                TRACE_OPT_MODEL_NAME,
+                torch_dtype=torch.float32,
+                **hf_kwargs,
+            ).to(device).eval()
+
+            prompt = "Autocast dtypes through OPT-125M."
+            trace_hf_inputs = trace_hf_tokenizer(prompt, return_tensors="pt")
+            trace_hf_inputs = {k: v.to(device) for k, v in trace_hf_inputs.items()}
+
+            TRACE_MODEL_KIND = "opt-125m"
+            print(f"[info] Using {TRACE_OPT_MODEL_NAME} for dtype tracing.")
+        except Exception as e:
+            trace_hf_model = None
+            trace_hf_inputs = None
+            trace_hf_tokenizer = None
+            if not ALLOW_OPT_DOWNLOAD:
+                print(
+                    f"[info] Could not load {TRACE_OPT_MODEL_NAME} from local cache_dir={HF_CACHE_DIR} ({e}). "
+                    "Set ALLOW_OPT_DOWNLOAD=True to download, or continue with TinyGPT."
+                )
+            else:
+                print(f"[info] Could not load {TRACE_OPT_MODEL_NAME} ({e}). Falling back to TinyGPT.")
+else:
+    print(f"[info] Using TinyGPT for dtype tracing on device_type={device.type} (OPT trace is CUDA-focused).")
 """)
 
 code(r"""
@@ -3405,11 +3472,18 @@ configs = [
 ]
 
 for title, param_dt, use_ac in configs:
-    model = TinyGPT(VOCAB, BLOCK).to(device).to(param_dt)
-    hooks, rec = install_dtype_hooks(model)
-    ctx = amp_autocast(device, dtype_16, enabled=use_ac)
-    with torch.inference_mode(), ctx:
-        _ = model(idx)
+    if TRACE_MODEL_KIND == "opt-125m" and trace_hf_model is not None:
+        model = trace_hf_model.to(param_dt).eval()
+        hooks, rec = install_dtype_hooks(model)
+        ctx = amp_autocast(device, dtype_16, enabled=use_ac)
+        with torch.inference_mode(), ctx:
+            _ = model(**trace_hf_inputs, use_cache=False)
+    else:
+        model = TinyGPT(VOCAB, BLOCK).to(device).to(param_dt)
+        hooks, rec = install_dtype_hooks(model)
+        ctx = amp_autocast(device, dtype_16, enabled=use_ac)
+        with torch.inference_mode(), ctx:
+            _ = model(idx)
     for h in hooks:
         h.remove()
     df = pd.DataFrame(rec)
@@ -3484,7 +3558,7 @@ md(r"""
 
 The dtype hooks above show *what* dtype each layer uses. But a deeper question is: **which layers are most affected by the precision change?**
 
-We'll feed the same input through our TinyGPT in FP32 vs under autocast, and measure the per-module output error. This tells you which operations are precision-sensitive and why the autocast policy protects certain ops.
+We'll do this on `TinyGPT` (the self-contained transformer above) because it's small enough to hook every module without external downloads or long runtimes. The takeaways generalize to OPT-125M and other LLMs: attention/logits, reductions, and normalization are usually where precision matters most.
 """)
 
 code(r"""
